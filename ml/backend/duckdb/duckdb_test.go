@@ -193,10 +193,33 @@ func TestRMSNorm(t *testing.T) {
 	}
 }
 
+func TestReshape(t *testing.T) {
+	_, ctx := setupContext(t)
+
+	tensor := ctx.FromFloats([]float32{1, 2, 3, 4, 5, 6}, 2, 3)
+	reshaped := tensor.Reshape(ctx, 3, 2)
+
+	if reshaped.Dim(0) != 3 || reshaped.Dim(1) != 2 {
+		t.Errorf("shape = [%d, %d], want [3, 2]", reshaped.Dim(0), reshaped.Dim(1))
+	}
+	assertFloats(t, reshaped.Floats(), []float32{1, 2, 3, 4, 5, 6}, 0)
+}
+
 func TestActivations(t *testing.T) {
 	_, ctx := setupContext(t)
 
 	tensor := ctx.FromFloats([]float32{-1, 0, 1, 2}, 4)
+
+	t.Run("SILU", func(t *testing.T) {
+		result := tensor.SILU(ctx)
+		got := result.Floats()
+		if math.Abs(float64(got[1])) > 1e-5 {
+			t.Errorf("SILU(0) = %f, want 0", got[1])
+		}
+		if got[2] <= 0 || got[3] <= 0 {
+			t.Errorf("SILU should be positive for positive input, got %v", got)
+		}
+	})
 
 	t.Run("RELU", func(t *testing.T) {
 		result := tensor.RELU(ctx)
@@ -210,6 +233,42 @@ func TestActivations(t *testing.T) {
 			t.Errorf("Sigmoid(0) = %f, want 0.5", got[1])
 		}
 	})
+}
+
+func TestSlice(t *testing.T) {
+	_, ctx := setupContext(t)
+
+	tensor := ctx.FromFloats([]float32{10, 20, 30, 40, 50, 60}, 6)
+	sliced := tensor.Slice(ctx, 0, 1, 4, 1)
+	assertFloats(t, sliced.Floats(), []float32{20, 30, 40}, 0)
+}
+
+func TestConcat(t *testing.T) {
+	_, ctx := setupContext(t)
+
+	a := ctx.FromFloats([]float32{1, 2, 3}, 3)
+	b := ctx.FromFloats([]float32{4, 5, 6}, 3)
+	c := a.Concat(ctx, b, 0)
+	assertFloats(t, c.Floats(), []float32{1, 2, 3, 4, 5, 6}, 0)
+}
+
+func TestFloat16Conversion(t *testing.T) {
+	tests := []struct {
+		bits uint16
+		want float32
+	}{
+		{0x3C00, 1.0},
+		{0x4000, 2.0},
+		{0x0000, 0.0},
+		{0xBC00, -1.0},
+		{0x3800, 0.5},
+	}
+	for _, tt := range tests {
+		got := float16ToFloat32(tt.bits)
+		if math.Abs(float64(got-tt.want)) > 1e-4 {
+			t.Errorf("float16ToFloat32(0x%04X) = %f, want %f", tt.bits, got, tt.want)
+		}
+	}
 }
 
 func TestDequantization(t *testing.T) {
