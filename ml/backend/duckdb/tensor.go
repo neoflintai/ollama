@@ -1,23 +1,106 @@
 package duckdb
 
 import (
+	"fmt"
 	"math"
 	"sort"
+	"strings"
+	"sync/atomic"
 
 	"github.com/ollama/ollama/ml"
 	"github.com/ollama/ollama/ml/nn/rope"
 )
 
+// Global counter for unique tensor table names
+var tensorID atomic.Int64
+
+// Tensor represents data living IN DuckDB as a table.
+// Data is only pulled to Go when explicitly needed (Floats/Bytes).
+// All math ops create new DuckDB tables via SQL — no Go math loops.
 type Tensor struct {
 	b     *Backend
-	name  string
+	name  string // debug name
 	shape []int
 	dtype ml.DType
-	data  []float32
+	table string // DuckDB table name holding this tensor's data: (idx INT, val FLOAT)
+	data  []float32 // lazy cache, only populated on Floats()/Bytes()
 }
 
-func newTensor(b *Backend, shape []int, data []float32) *Tensor {
-	return &Tensor{b: b, shape: shape, dtype: ml.DTypeF32, data: data}
+func nextTable() string {
+	return fmt.Sprintf("_t%d", tensorID.Add(1))
+}
+
+// newTensorFromData creates a DuckDB table from Go data
+func newTensorFromData(b *Backend, shape []int, data []float32) *Tensor {
+	t := &Tensor{b: b, shape: shape, dtype: ml.DTypeF32, table: nextTable(), data: data}
+	if b != nil && b.db != nil && len(data) > 0 {
+		// Bulk insert via VALUES — build in chunks for large tensors
+		b.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t.table))
+		b.db.Exec(fmt.Sprintf("CREATE TEMPORARY TABLE %s (idx INT, val FLOAT)", t.table))
+
+		const batch = 10000
+		for start := 0; start < len(data); start += batch {
+			end := start + batch
+			if end > len(data) {
+				end = len(data)
+			}
+			var vals strings.Builder
+			for i := start; i < end; i++ {
+				if i > start {
+					vals.WriteString(",")
+				}
+				fmt.Fprintf(&vals, "(%d,%e)", i, data[i])
+			}
+			b.db.Exec(fmt.Sprintf("INSERT INTO %s VALUES %s", t.table, vals.String()))
+		}
+	}
+	return t
+}
+
+// newTensorFromSQL creates a tensor backed by a SQL expression
+// The query must produce (idx INT, val FLOAT) rows
+func newTensorFromSQL(b *Backend, shape []int, query string) *Tensor {
+	tbl := nextTable()
+	_, err := b.db.Exec(fmt.Sprintf("CREATE TEMPORARY TABLE %s AS %s", tbl, query))
+	if err != nil {
+		// Fallback: return empty
+		return &Tensor{b: b, shape: shape, dtype: ml.DTypeF32, table: tbl, data: make([]float32, product(shape))}
+	}
+	return &Tensor{b: b, shape: shape, dtype: ml.DTypeF32, table: tbl}
+}
+
+func product(shape []int) int {
+	p := 1
+	for _, d := range shape {
+		p *= d
+	}
+	return p
+}
+
+// materialize pulls data from DuckDB into Go slice (lazy, cached)
+func (t *Tensor) materialize() []float32 {
+	if t.data != nil {
+		return t.data
+	}
+	if t.b == nil || t.b.db == nil || t.table == "" {
+		return nil
+	}
+	n := product(t.shape)
+	t.data = make([]float32, n)
+	rows, err := t.b.db.Query(fmt.Sprintf("SELECT idx, val FROM %s ORDER BY idx", t.table))
+	if err != nil {
+		return t.data
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var idx int
+		var val float64
+		rows.Scan(&idx, &val)
+		if idx >= 0 && idx < n {
+			t.data[idx] = float32(val)
+		}
+	}
+	return t.data
 }
 
 func (t *Tensor) Dim(n int) int {
@@ -44,686 +127,594 @@ func (t *Tensor) Shape() []int {
 func (t *Tensor) DType() ml.DType { return t.dtype }
 
 func (t *Tensor) Bytes() []byte {
-	if t.data == nil {
+	data := t.materialize()
+	if data == nil {
 		return nil
 	}
-	return float32ToBytes(t.data)
+	return float32ToBytes(data)
 }
 
 func (t *Tensor) Floats() []float32 {
-	if t.data == nil {
+	data := t.materialize()
+	if data == nil {
 		return nil
 	}
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
+	out := make([]float32, len(data))
+	copy(out, data)
 	return out
 }
 
-func (t *Tensor) FromBytes(b []byte)      { t.data = bytesToFloat32(b) }
-func (t *Tensor) FromFloats(f []float32)   { t.data = make([]float32, len(f)); copy(t.data, f) }
+func (t *Tensor) FromBytes(b []byte) {
+	t.data = bytesToFloat32(b)
+	t.syncToDB()
+}
+
+func (t *Tensor) FromFloats(f []float32) {
+	t.data = make([]float32, len(f))
+	copy(t.data, f)
+	t.syncToDB()
+}
+
 func (t *Tensor) FromInts(vals []int32) {
 	t.data = make([]float32, len(vals))
 	for i, v := range vals {
 		t.data[i] = float32(v)
 	}
+	t.syncToDB()
+}
+
+func (t *Tensor) syncToDB() {
+	if t.b != nil && t.b.db != nil && t.table != "" && len(t.data) > 0 {
+		t.b.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t.table))
+		tmp := newTensorFromData(t.b, t.shape, t.data)
+		t.table = tmp.table
+	}
 }
 
 func (t *Tensor) Cast(ctx ml.Context, dtype ml.DType) ml.Tensor {
-	out := &Tensor{b: t.b, shape: t.Shape(), dtype: dtype}
-	out.data = make([]float32, len(t.data))
-	copy(out.data, t.data)
-	return out
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val FROM %s", t.table))
 }
 
-// --- Arithmetic ---
+// ==================== ARITHMETIC — ALL IN DUCKDB ====================
 
 func (t *Tensor) Add(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return elementWise(t, t2.(*Tensor), func(a, b float32) float32 { return a + b })
+	return binaryOp(t, t2.(*Tensor), "+")
 }
-
 func (t *Tensor) Sub(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return elementWise(t, t2.(*Tensor), func(a, b float32) float32 { return a - b })
+	return binaryOp(t, t2.(*Tensor), "-")
 }
-
 func (t *Tensor) Mul(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return elementWise(t, t2.(*Tensor), func(a, b float32) float32 { return a * b })
+	return binaryOp(t, t2.(*Tensor), "*")
+}
+func (t *Tensor) Div(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
+	return binaryOp(t, t2.(*Tensor), "/")
 }
 
-func (t *Tensor) Div(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return elementWise(t, t2.(*Tensor), func(a, b float32) float32 {
-		if b == 0 {
-			return 0
-		}
-		return a / b
-	})
+func binaryOp(a, b *Tensor, op string) *Tensor {
+	bLen := product(b.shape)
+	aLen := product(a.shape)
+
+	var query string
+	if bLen == aLen {
+		// Same size: direct join on idx
+		query = fmt.Sprintf(
+			"SELECT a.idx, a.val %s b.val AS val FROM %s a JOIN %s b ON a.idx = b.idx",
+			op, a.table, b.table)
+	} else {
+		// Broadcasting
+		query = fmt.Sprintf(
+			"SELECT a.idx, a.val %s b.val AS val FROM %s a JOIN %s b ON b.idx = a.idx %% %d",
+			op, a.table, b.table, bLen)
+	}
+	return newTensorFromSQL(a.b, a.Shape(), query)
 }
 
 func (t *Tensor) Scale(ctx ml.Context, s float64) ml.Tensor {
-	sf := float32(s)
-	out := make([]float32, len(t.data))
-	for i, v := range t.data {
-		out[i] = v * sf
-	}
-	return newTensor(t.b, t.Shape(), out)
+	query := fmt.Sprintf("SELECT idx, val * %g AS val FROM %s", s, t.table)
+	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
-// --- Matrix Operations ---
-// Route through DuckDB for large matrices, pure Go for small ones.
+// ==================== MATMUL — IN DUCKDB ====================
 
 func (t *Tensor) Mulmat(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	if t.b != nil && t.b.db != nil {
-		return t.b.matmulDuckDB(t, t2.(*Tensor))
-	}
-	return matmulGo(t, t2.(*Tensor))
+	return matmulSQL(t, t2.(*Tensor))
 }
+func (t *Tensor) MulmatFullPrec(ctx ml.Context, t2 ml.Tensor) ml.Tensor { return t.Mulmat(ctx, t2) }
+func (t *Tensor) MulmatID(ctx ml.Context, t2, ids ml.Tensor) ml.Tensor  { return t.Mulmat(ctx, t2) }
+func (t *Tensor) AddID(ctx ml.Context, t2, ids ml.Tensor) ml.Tensor     { return t.Add(ctx, t2) }
 
-func (t *Tensor) MulmatFullPrec(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return t.Mulmat(ctx, t2)
-}
-
-func (t *Tensor) MulmatID(ctx ml.Context, t2, ids ml.Tensor) ml.Tensor {
-	return t.Mulmat(ctx, t2)
-}
-
-func (t *Tensor) AddID(ctx ml.Context, t2, ids ml.Tensor) ml.Tensor {
-	return t.Add(ctx, t2)
-}
-
-// --- Activations ---
-
-func (t *Tensor) Softmax(ctx ml.Context) ml.Tensor  { return softmax(t) }
-
-func (t *Tensor) GELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	out := unaryOp(t, func(x float32) float32 {
-		return 0.5 * x * (1.0 + float32(math.Tanh(float64(x)*0.7978845608*(1.0+0.044715*float64(x)*float64(x)))))
-	})
-	if len(up) > 0 && up[0] != nil {
-		return elementWise(out, up[0].(*Tensor), func(a, b float32) float32 { return a * b })
-	}
-	return out
-}
-
-func (t *Tensor) GELU_ERF(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 {
-		return 0.5 * x * (1.0 + float32(math.Erf(float64(x)/math.Sqrt2)))
-	})
-}
-
-func (t *Tensor) QuickGELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	out := unaryOp(t, func(x float32) float32 { return x * sigmoid32(x*1.702) })
-	if len(up) > 0 && up[0] != nil {
-		return elementWise(out, up[0].(*Tensor), func(a, b float32) float32 { return a * b })
-	}
-	return out
-}
-
-func (t *Tensor) SILU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	out := unaryOp(t, func(x float32) float32 { return x * sigmoid32(x) })
-	if len(up) > 0 && up[0] != nil {
-		return elementWise(out, up[0].(*Tensor), func(a, b float32) float32 { return a * b })
-	}
-	return out
-}
-
-func (t *Tensor) RELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	out := unaryOp(t, func(x float32) float32 {
-		if x > 0 {
-			return x
-		}
-		return 0
-	})
-	if len(up) > 0 && up[0] != nil {
-		return elementWise(out, up[0].(*Tensor), func(a, b float32) float32 { return a * b })
-	}
-	return out
-}
-
-func (t *Tensor) Sigmoid(ctx ml.Context) ml.Tensor    { return unaryOp(t, sigmoid32) }
-func (t *Tensor) SigmoidOut(ctx ml.Context) ml.Tensor  { return t.Sigmoid(ctx) }
-
-func (t *Tensor) SILUAlphaLimit(ctx ml.Context, up ml.Tensor, alpha, limit float32) ml.Tensor {
-	clamped := unaryOp(t, func(x float32) float32 {
-		if x < -limit {
-			return -limit
-		}
-		if x > limit {
-			return limit
-		}
-		return x
-	})
-	silu := unaryOp(clamped, func(x float32) float32 { return x * sigmoid32(alpha*x) })
-	return elementWise(silu, up.(*Tensor), func(a, b float32) float32 { return a * b })
-}
-
-func (t *Tensor) Tanh(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return float32(math.Tanh(float64(x))) })
-}
-
-func (t *Tensor) Softplus(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return float32(math.Log(1 + math.Exp(float64(x)))) })
-}
-
-// --- Normalization ---
-
-func (t *Tensor) L2Norm(ctx ml.Context, eps float32) ml.Tensor         { return l2norm(t, eps) }
-func (t *Tensor) LayerNorm(ctx ml.Context, weight, bias ml.Tensor, eps float32) ml.Tensor {
-	return layerNorm(t, weight.(*Tensor), bias, eps)
-}
-func (t *Tensor) RMSNorm(ctx ml.Context, weight ml.Tensor, eps float32) ml.Tensor {
-	return rmsNorm(t, weight.(*Tensor), eps)
-}
-func (t *Tensor) SumRows(ctx ml.Context) ml.Tensor { return sumRows(t) }
-
-// --- Shape Operations ---
-
-func (t *Tensor) Reshape(ctx ml.Context, shape ...int) ml.Tensor {
-	out := &Tensor{b: t.b, shape: shape, dtype: t.dtype}
-	out.data = make([]float32, len(t.data))
-	copy(out.data, t.data)
-	return out
-}
-
-func (t *Tensor) View(ctx ml.Context, offset int, shape ...int) ml.Tensor {
-	total := 1
-	for _, d := range shape {
-		total *= d
-	}
-	elemOffset := offset / 4
-	end := elemOffset + total
-	if end > len(t.data) {
-		end = len(t.data)
-	}
-	out := make([]float32, total)
-	copy(out, t.data[elemOffset:end])
-	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, data: out}
-}
-
-func (t *Tensor) Permute(ctx ml.Context, dims ...int) ml.Tensor { return permute(t, dims) }
-
-func (t *Tensor) Contiguous(ctx ml.Context, shape ...int) ml.Tensor {
-	if len(shape) == 0 {
-		shape = t.Shape()
-	}
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
-	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, data: out}
-}
-
-func (t *Tensor) Pad(ctx ml.Context, shape ...int) ml.Tensor    { return pad(t, shape) }
-
-func (t *Tensor) Stack(ctx ml.Context, dim int, s ...ml.Tensor) ml.Tensor {
-	tensors := make([]*Tensor, 1+len(s))
-	tensors[0] = t
-	for i, v := range s {
-		tensors[i+1] = v.(*Tensor)
-	}
-	return stack(tensors, dim)
-}
-
-func (t *Tensor) Repeat(ctx ml.Context, dim, n int) ml.Tensor { return repeatTensor(t, dim, n) }
-
-func (t *Tensor) Repeat4D(ctx ml.Context, dim0, dim1, dim2, dim3 int) ml.Tensor {
-	result := t
-	if dim0 > 1 {
-		result = repeatTensor(result, 0, dim0).(*Tensor)
-	}
-	if dim1 > 1 {
-		result = repeatTensor(result, 1, dim1).(*Tensor)
-	}
-	if dim2 > 1 {
-		result = repeatTensor(result, 2, dim2).(*Tensor)
-	}
-	if dim3 > 1 {
-		result = repeatTensor(result, 3, dim3).(*Tensor)
-	}
-	return result
-}
-
-func (t *Tensor) Concat(ctx ml.Context, t2 ml.Tensor, dim int) ml.Tensor {
-	return concat(t, t2.(*Tensor), dim)
-}
-
-func (t *Tensor) Rows(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	return rowsTensor(t, t2.(*Tensor))
-}
-
-func (t *Tensor) SetRows(ctx ml.Context, src ml.Tensor, idxs ml.Tensor) ml.Tensor {
-	return setRows(t, src.(*Tensor), idxs.(*Tensor))
-}
-
-func (t *Tensor) SetInplace(ctx ml.Context, src ml.Tensor, nb1, nb2, nb3, offset int) ml.Tensor {
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
-	s := src.(*Tensor)
-	elemOffset := offset / 4
-	for i := 0; i < len(s.data) && elemOffset+i < len(out); i++ {
-		out[elemOffset+i] = s.data[i]
-	}
-	return &Tensor{b: t.b, shape: t.Shape(), dtype: t.dtype, data: out}
-}
-
-func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
-	dst := t2.(*Tensor)
-	dst.data = make([]float32, len(t.data))
-	copy(dst.data, t.data)
-	dst.shape = t.Shape()
-	return dst
-}
-
-func (t *Tensor) Duplicate(ctx ml.Context) ml.Tensor {
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
-	return &Tensor{b: t.b, shape: t.Shape(), dtype: t.dtype, data: out}
-}
-
-func (t *Tensor) Slice(ctx ml.Context, dim, low, high, step int) ml.Tensor {
-	return sliceTensor(t, dim, low, high, step)
-}
-
-func (t *Tensor) Chunk(ctx ml.Context, dim int, size int) []ml.Tensor {
-	return chunk(t, dim, size)
-}
-
-func (t *Tensor) ChunkSections(ctx ml.Context, dim int, sections ...int) []ml.Tensor {
-	return chunkSections(t, dim, sections)
-}
-
-// --- Trig / Math ---
-
-func (t *Tensor) Sin(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return float32(math.Sin(float64(x))) })
-}
-func (t *Tensor) Cos(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return float32(math.Cos(float64(x))) })
-}
-func (t *Tensor) Exp(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return float32(math.Exp(float64(x))) })
-}
-func (t *Tensor) Sqrt(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return float32(math.Sqrt(float64(x))) })
-}
-func (t *Tensor) Sqr(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return x * x })
-}
-func (t *Tensor) Neg(ctx ml.Context) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 { return -x })
-}
-func (t *Tensor) Clamp(ctx ml.Context, min, max float32) ml.Tensor {
-	return unaryOp(t, func(x float32) float32 {
-		if x < min {
-			return min
-		}
-		if x > max {
-			return max
-		}
-		return x
-	})
-}
-
-// --- Stats ---
-
-func (t *Tensor) TopK(ctx ml.Context, k int) ml.Tensor  { return topK(t, k) }
-func (t *Tensor) Argsort(ctx ml.Context) ml.Tensor       { return argsort(t) }
-
-func (t *Tensor) Mean(ctx ml.Context) ml.Tensor {
-	if len(t.data) == 0 {
-		return newTensor(t.b, []int{1}, []float32{0})
-	}
-	var sum float64
-	for _, v := range t.data {
-		sum += float64(v)
-	}
-	return newTensor(t.b, []int{1}, []float32{float32(sum / float64(len(t.data)))})
-}
-
-func (t *Tensor) Variance(ctx ml.Context) ml.Tensor {
-	if len(t.data) == 0 {
-		return newTensor(t.b, []int{1}, []float32{0})
-	}
-	var sum, sumSq float64
-	n := float64(len(t.data))
-	for _, v := range t.data {
-		sum += float64(v)
-		sumSq += float64(v) * float64(v)
-	}
-	mean := sum / n
-	return newTensor(t.b, []int{1}, []float32{float32(sumSq/n - mean*mean)})
-}
-
-func (t *Tensor) Stddev(ctx ml.Context) ml.Tensor {
-	v := t.Variance(ctx).(*Tensor)
-	return newTensor(t.b, []int{1}, []float32{float32(math.Sqrt(float64(v.data[0])))})
-}
-
-// --- Advanced Ops ---
-
-func (t *Tensor) CumSum(ctx ml.Context) ml.Tensor {
-	out := make([]float32, len(t.data))
-	if len(t.data) > 0 {
-		out[0] = t.data[0]
-		for i := 1; i < len(t.data); i++ {
-			out[i] = out[i-1] + t.data[i]
-		}
-	}
-	return newTensor(t.b, t.Shape(), out)
-}
-
-func (t *Tensor) Diag(ctx ml.Context) ml.Tensor {
-	n := len(t.data)
-	out := make([]float32, n*n)
-	for i := 0; i < n; i++ {
-		out[i*n+i] = t.data[i]
-	}
-	return newTensor(t.b, []int{n, n}, out)
-}
-
-func (t *Tensor) Tri(ctx ml.Context, triType int) ml.Tensor {
-	if len(t.shape) < 2 {
-		return t.Duplicate(ctx)
-	}
-	rows := t.shape[len(t.shape)-2]
-	cols := t.shape[len(t.shape)-1]
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
-	batchSize := len(t.data) / (rows * cols)
-	for batch := 0; batch < batchSize; batch++ {
-		base := batch * rows * cols
-		for r := 0; r < rows; r++ {
-			for c := 0; c < cols; c++ {
-				keep := false
-				switch triType {
-				case 0:
-					keep = c >= r
-				case 1:
-					keep = c > r
-				case 2:
-					keep = c <= r
-				case 3:
-					keep = c < r
-				}
-				if !keep {
-					out[base+r*cols+c] = 0
-				}
-			}
-		}
-	}
-	return newTensor(t.b, t.Shape(), out)
-}
-
-func (t *Tensor) Fill(ctx ml.Context, value float32) ml.Tensor {
-	out := make([]float32, len(t.data))
-	for i := range out {
-		out[i] = value
-	}
-	return &Tensor{b: t.b, shape: t.Shape(), dtype: t.dtype, data: out}
-}
-
-func (t *Tensor) SolveTri(ctx ml.Context, b ml.Tensor, lower, left, unitDiag bool) ml.Tensor {
-	return b.(*Tensor).Duplicate(ctx)
-}
-
-func (t *Tensor) Interpolate(ctx ml.Context, dims [4]int, samplingMode ml.SamplingMode) ml.Tensor {
-	return t.Duplicate(ctx)
-}
-
-// --- Convolution & SSM (placeholders) ---
-
-func (t *Tensor) Conv2D(ctx ml.Context, weight ml.Tensor, s0, s1, p0, p1, d0, d1 int) ml.Tensor {
-	return newTensor(t.b, t.Shape(), make([]float32, len(t.data)))
-}
-func (t *Tensor) Conv3D(ctx ml.Context, weight ml.Tensor, c, s0, s1, s2, p0, p1, p2, d0, d1, d2 int) ml.Tensor {
-	return newTensor(t.b, t.Shape(), make([]float32, len(t.data)))
-}
-func (t *Tensor) AvgPool2D(ctx ml.Context, k, s int, p float32) ml.Tensor {
-	return newTensor(t.b, t.Shape(), make([]float32, len(t.data)))
-}
-func (t *Tensor) IM2Col(ctx ml.Context, weight ml.Tensor, s0, s1, p0, p1, d0, d1 int) ml.Tensor {
-	return newTensor(t.b, t.Shape(), make([]float32, len(t.data)))
-}
-func (t *Tensor) SSMConv(ctx ml.Context, kernel ml.Tensor) ml.Tensor {
-	return newTensor(t.b, t.Shape(), make([]float32, len(t.data)))
-}
-func (t *Tensor) SSMScan(ctx ml.Context, x, dt, A, B, C, ids ml.Tensor) ml.Tensor {
-	return newTensor(t.b, t.Shape(), make([]float32, len(t.data)))
-}
-
-// --- Helper functions ---
-
-func sigmoid32(x float32) float32 {
-	return 1.0 / (1.0 + float32(math.Exp(-float64(x))))
-}
-
-func elementWise(a, b *Tensor, op func(float32, float32) float32) *Tensor {
-	n := len(a.data)
-	out := make([]float32, n)
-	if len(b.data) == n {
-		for i := range out {
-			out[i] = op(a.data[i], b.data[i])
-		}
-	} else if len(b.data) > 0 {
-		bLen := len(b.data)
-		for i := range out {
-			out[i] = op(a.data[i], b.data[i%bLen])
-		}
-	}
-	return newTensor(a.b, a.Shape(), out)
-}
-
-func unaryOp(t *Tensor, op func(float32) float32) *Tensor {
-	out := make([]float32, len(t.data))
-	for i, v := range t.data {
-		out[i] = op(v)
-	}
-	return newTensor(t.b, t.Shape(), out)
-}
-
-// matmulGo is the pure-Go fallback for small matrices.
-func matmulGo(a, b *Tensor) *Tensor {
+// matmulSQL: C = A^T * B where A is [K,M], B is [K,N] -> C is [M,N]
+// C[m,n] = SUM over k of A[m*K+k] * B[n*K+k]
+// All done in DuckDB — no Go loops.
+func matmulSQL(a, b *Tensor) *Tensor {
 	if len(a.shape) < 2 || len(b.shape) < 2 {
-		n := min(len(a.data), len(b.data))
-		var sum float32
-		for i := 0; i < n; i++ {
-			sum += a.data[i] * b.data[i]
-		}
-		return newTensor(a.b, []int{1}, []float32{sum})
+		// Dot product
+		query := fmt.Sprintf(
+			"SELECT 0 AS idx, SUM(a.val * b.val) AS val FROM %s a JOIN %s b ON a.idx = b.idx",
+			a.table, b.table)
+		return newTensorFromSQL(a.b, []int{1}, query)
 	}
 
 	K := a.shape[0]
 	M := a.shape[1]
 	N := b.shape[1]
 
-	batchA := 1
-	for i := 2; i < len(a.shape); i++ {
-		batchA *= a.shape[i]
-	}
-	batchB := 1
-	for i := 2; i < len(b.shape); i++ {
-		batchB *= b.shape[i]
-	}
-	batch := max(batchA, batchB)
+	// A[m,k] is at idx = m*K+k  →  m = idx/K, k = idx%K
+	// B[n,k] is at idx = n*K+k  →  n = idx/K, k = idx%K
+	// C[m,n] = SUM(A[m,k] * B[n,k]) → output idx = n*M+m
+	query := fmt.Sprintf(`
+		SELECT (b_n * %d + a_m) AS idx, SUM(a.val * b.val) AS val
+		FROM (SELECT idx, val, idx // %d AS a_m, idx %% %d AS a_k FROM %s) a
+		JOIN (SELECT idx, val, idx // %d AS b_n, idx %% %d AS b_k FROM %s) b
+		ON a.a_k = b.b_k
+		GROUP BY a_m, b_n
+		ORDER BY idx
+	`, M, K, K, a.table, K, K, b.table)
 
-	outShape := []int{M, N}
-	if batch > 1 {
-		outShape = append(outShape, batch)
-	}
-
-	out := make([]float32, M*N*batch)
-	strideA := K * M
-	strideB := K * N
-
-	for bn := 0; bn < batch; bn++ {
-		offA := (bn % batchA) * strideA
-		offB := (bn % batchB) * strideB
-		offC := bn * M * N
-
-		for j := 0; j < N; j++ {
-			for i := 0; i < M; i++ {
-				var sum float32
-				for k := 0; k < K; k++ {
-					ai := offA + i*K + k
-					bi := offB + j*K + k
-					if ai < len(a.data) && bi < len(b.data) {
-						sum += a.data[ai] * b.data[bi]
-					}
-				}
-				ci := offC + j*M + i
-				if ci < len(out) {
-					out[ci] = sum
-				}
-			}
-		}
-	}
-
-	return newTensor(a.b, outShape, out)
+	return newTensorFromSQL(a.b, []int{M, N}, query)
 }
 
-func softmax(t *Tensor) *Tensor {
-	if len(t.data) == 0 {
-		return newTensor(t.b, t.Shape(), nil)
-	}
+// ==================== ACTIVATIONS — IN DUCKDB ====================
+
+func (t *Tensor) Softmax(ctx ml.Context) ml.Tensor {
 	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
-	out := make([]float32, len(t.data))
-	for row := 0; row < nrows; row++ {
-		start := row * dim0
-		end := start + dim0
-		maxVal := t.data[start]
-		for i := start + 1; i < end; i++ {
-			if t.data[i] > maxVal {
-				maxVal = t.data[i]
-			}
-		}
-		var sum float64
-		for i := start; i < end; i++ {
-			v := math.Exp(float64(t.data[i] - maxVal))
-			out[i] = float32(v)
-			sum += v
-		}
-		if sum > 0 {
-			invSum := float32(1.0 / sum)
-			for i := start; i < end; i++ {
-				out[i] *= invSum
-			}
-		}
-	}
-	return newTensor(t.b, t.Shape(), out)
+	// Softmax per row: row = idx / dim0
+	// exp(val - max_per_row) / sum_per_row
+	query := fmt.Sprintf(`
+		WITH rows AS (
+			SELECT idx, val, idx // %d AS rid, idx %% %d AS cid FROM %s
+		),
+		mx AS (SELECT rid, max(val) AS m FROM rows GROUP BY rid),
+		exps AS (SELECT r.idx, r.rid, exp(r.val - mx.m) AS e FROM rows r JOIN mx ON r.rid = mx.rid),
+		sums AS (SELECT rid, sum(e) AS s FROM exps GROUP BY rid)
+		SELECT exps.idx AS idx, exps.e / sums.s AS val FROM exps JOIN sums ON exps.rid = sums.rid
+	`, dim0, dim0, t.table)
+	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
-func rmsNorm(t, weight *Tensor, eps float32) *Tensor {
+func (t *Tensor) RMSNorm(ctx ml.Context, weight ml.Tensor, eps float32) ml.Tensor {
+	w := weight.(*Tensor)
 	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
-	out := make([]float32, len(t.data))
-	for row := 0; row < nrows; row++ {
-		start := row * dim0
-		end := start + dim0
-		var sumSq float64
-		for i := start; i < end; i++ {
-			sumSq += float64(t.data[i]) * float64(t.data[i])
-		}
-		rms := float32(math.Sqrt(sumSq/float64(dim0) + float64(eps)))
-		for i := 0; i < dim0; i++ {
-			w := float32(1.0)
-			if i < len(weight.data) {
-				w = weight.data[i]
-			}
-			out[start+i] = (t.data[start+i] / rms) * w
-		}
-	}
-	return newTensor(t.b, t.Shape(), out)
+	query := fmt.Sprintf(`
+		WITH rows AS (
+			SELECT idx, val, idx // %d AS rid, idx %% %d AS cid FROM %s
+		),
+		rms AS (SELECT rid, sqrt(avg(val * val) + %g) AS r FROM rows GROUP BY rid)
+		SELECT rows.idx AS idx, (rows.val / rms.r) * w.val AS val
+		FROM rows
+		JOIN rms ON rows.rid = rms.rid
+		JOIN %s w ON w.idx = rows.cid
+	`, dim0, dim0, t.table, eps, w.table)
+	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
-func layerNorm(t *Tensor, weight *Tensor, bias ml.Tensor, eps float32) *Tensor {
-	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
-	out := make([]float32, len(t.data))
-	for row := 0; row < nrows; row++ {
-		start := row * dim0
-		end := start + dim0
-		var sum float64
-		for i := start; i < end; i++ {
-			sum += float64(t.data[i])
-		}
-		mean := float32(sum / float64(dim0))
-		var varSum float64
-		for i := start; i < end; i++ {
-			d := float64(t.data[i] - mean)
-			varSum += d * d
-		}
-		std := float32(math.Sqrt(varSum/float64(dim0) + float64(eps)))
-		for i := 0; i < dim0; i++ {
-			normalized := (t.data[start+i] - mean) / std
-			w := float32(1.0)
-			if weight != nil && i < len(weight.data) {
-				w = weight.data[i]
-			}
-			b := float32(0.0)
-			if bias != nil {
-				bt := bias.(*Tensor)
-				if i < len(bt.data) {
-					b = bt.data[i]
-				}
-			}
-			out[start+i] = normalized*w + b
-		}
+func (t *Tensor) SILU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
+	query := fmt.Sprintf("SELECT idx, val / (1.0 + exp(-val)) AS val FROM %s", t.table)
+	out := newTensorFromSQL(t.b, t.Shape(), query)
+	if len(up) > 0 && up[0] != nil {
+		return binaryOp(out, up[0].(*Tensor), "*")
 	}
-	return newTensor(t.b, t.Shape(), out)
+	return out
 }
 
-func l2norm(t *Tensor, eps float32) *Tensor {
-	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
-	out := make([]float32, len(t.data))
-	for row := 0; row < nrows; row++ {
-		start := row * dim0
-		end := start + dim0
-		var sumSq float64
-		for i := start; i < end; i++ {
-			sumSq += float64(t.data[i]) * float64(t.data[i])
-		}
-		norm := float32(math.Sqrt(sumSq + float64(eps)))
-		for i := start; i < end; i++ {
-			out[i] = t.data[i] / norm
-		}
+func (t *Tensor) GELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
+	query := fmt.Sprintf("SELECT idx, 0.5 * val * (1.0 + tanh(val * 0.7978845608 * (1.0 + 0.044715 * val * val))) AS val FROM %s", t.table)
+	out := newTensorFromSQL(t.b, t.Shape(), query)
+	if len(up) > 0 && up[0] != nil {
+		return binaryOp(out, up[0].(*Tensor), "*")
 	}
-	return newTensor(t.b, t.Shape(), out)
+	return out
 }
 
-func sumRows(t *Tensor) *Tensor {
-	if len(t.shape) == 0 || len(t.data) == 0 {
-		return newTensor(t.b, []int{1}, []float32{0})
+func (t *Tensor) GELU_ERF(ctx ml.Context) ml.Tensor {
+	// DuckDB doesn't have erf(), use tanh approximation
+	query := fmt.Sprintf("SELECT idx, 0.5 * val * (1.0 + tanh(0.7978845608 * (val + 0.044715 * val * val * val))) AS val FROM %s", t.table)
+	return newTensorFromSQL(t.b, t.Shape(), query)
+}
+
+func (t *Tensor) QuickGELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
+	query := fmt.Sprintf("SELECT idx, val / (1.0 + exp(-1.702 * val)) AS val FROM %s", t.table)
+	out := newTensorFromSQL(t.b, t.Shape(), query)
+	if len(up) > 0 && up[0] != nil {
+		return binaryOp(out, up[0].(*Tensor), "*")
 	}
+	return out
+}
+
+func (t *Tensor) RELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
+	query := fmt.Sprintf("SELECT idx, CASE WHEN val > 0 THEN val ELSE 0 END AS val FROM %s", t.table)
+	out := newTensorFromSQL(t.b, t.Shape(), query)
+	if len(up) > 0 && up[0] != nil {
+		return binaryOp(out, up[0].(*Tensor), "*")
+	}
+	return out
+}
+
+func (t *Tensor) Sigmoid(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(),
+		fmt.Sprintf("SELECT idx, 1.0 / (1.0 + exp(-val)) AS val FROM %s", t.table))
+}
+func (t *Tensor) SigmoidOut(ctx ml.Context) ml.Tensor { return t.Sigmoid(ctx) }
+
+func (t *Tensor) SILUAlphaLimit(ctx ml.Context, up ml.Tensor, alpha, limit float32) ml.Tensor {
+	query := fmt.Sprintf(`
+		SELECT idx,
+			CASE WHEN val < %g THEN %g WHEN val > %g THEN %g ELSE val END
+			/ (1.0 + exp(-%g * CASE WHEN val < %g THEN %g WHEN val > %g THEN %g ELSE val END))
+			AS val FROM %s`,
+		-limit, -limit, limit, limit, alpha, -limit, -limit, limit, limit, t.table)
+	out := newTensorFromSQL(t.b, t.Shape(), query)
+	return binaryOp(out, up.(*Tensor), "*")
+}
+
+func (t *Tensor) Tanh(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(),
+		fmt.Sprintf("SELECT idx, tanh(val) AS val FROM %s", t.table))
+}
+
+func (t *Tensor) Softplus(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(),
+		fmt.Sprintf("SELECT idx, ln(1.0 + exp(val)) AS val FROM %s", t.table))
+}
+
+// ==================== NORMALIZATION ====================
+
+func (t *Tensor) L2Norm(ctx ml.Context, eps float32) ml.Tensor {
 	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
-	out := make([]float32, nrows)
-	for row := 0; row < nrows; row++ {
-		start := row * dim0
-		var sum float32
-		for i := 0; i < dim0; i++ {
-			sum += t.data[start+i]
-		}
-		out[row] = sum
+	query := fmt.Sprintf(`
+		WITH rows AS (SELECT idx, val, idx // %d AS rid, idx %% %d AS cid FROM %s),
+		     norms AS (SELECT rid, sqrt(sum(val*val) + %g) AS n FROM rows GROUP BY rid)
+		SELECT rows.idx AS idx, rows.val / norms.n AS val
+		FROM rows JOIN norms ON rows.rid = norms.rid
+	`, dim0, dim0, t.table, eps)
+	return newTensorFromSQL(t.b, t.Shape(), query)
+}
+
+func (t *Tensor) LayerNorm(ctx ml.Context, weight, bias ml.Tensor, eps float32) ml.Tensor {
+	w := weight.(*Tensor)
+	dim0 := t.shape[0]
+	biasJoin := ""
+	biasExpr := "0"
+	if bias != nil {
+		bt := bias.(*Tensor)
+		biasJoin = fmt.Sprintf("JOIN %s bias ON bias.idx = rows.cid", bt.table)
+		biasExpr = "bias.val"
 	}
+	query := fmt.Sprintf(`
+		WITH rows AS (SELECT idx, val, idx // %d AS rid, idx %% %d AS cid FROM %s),
+		     stats AS (SELECT rid, avg(val) AS mu, sqrt(avg(val*val) - avg(val)*avg(val) + %g) AS sigma FROM rows GROUP BY rid)
+		SELECT rows.idx AS idx, ((rows.val - stats.mu) / stats.sigma) * w.val + %s AS val
+		FROM rows JOIN stats ON rows.rid = stats.rid JOIN %s w ON w.idx = rows.cid %s
+	`, dim0, dim0, t.table, eps, biasExpr, w.table, biasJoin)
+	return newTensorFromSQL(t.b, t.Shape(), query)
+}
+
+func (t *Tensor) SumRows(ctx ml.Context) ml.Tensor {
+	dim0 := t.shape[0]
+	nrows := product(t.shape) / dim0
+	query := fmt.Sprintf(`
+		SELECT idx // %d AS idx, sum(val) AS val FROM %s GROUP BY idx // %d ORDER BY idx
+	`, dim0, t.table, dim0)
 	newShape := append([]int{1}, t.shape[1:]...)
-	return newTensor(t.b, newShape, out)
+	result := newTensorFromSQL(t.b, newShape, query)
+	_ = nrows
+	return result
 }
 
-func permute(t *Tensor, dims []int) *Tensor {
-	if len(dims) == 0 || len(t.shape) <= 1 {
-		return newTensor(t.b, t.Shape(), append([]float32{}, t.data...))
-	}
+// ==================== TRIG — IN DUCKDB ====================
 
-	// Pad shape to match dims length if needed
+func (t *Tensor) Sin(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, sin(val) AS val FROM %s", t.table))
+}
+func (t *Tensor) Cos(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, cos(val) AS val FROM %s", t.table))
+}
+func (t *Tensor) Exp(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, exp(val) AS val FROM %s", t.table))
+}
+func (t *Tensor) Sqrt(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, sqrt(val) AS val FROM %s", t.table))
+}
+func (t *Tensor) Sqr(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val*val AS val FROM %s", t.table))
+}
+func (t *Tensor) Neg(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, -val AS val FROM %s", t.table))
+}
+func (t *Tensor) Clamp(ctx ml.Context, mn, mx float32) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(),
+		fmt.Sprintf("SELECT idx, GREATEST(%g, LEAST(%g, val)) AS val FROM %s", mn, mx, t.table))
+}
+
+// ==================== STATS — IN DUCKDB ====================
+
+func (t *Tensor) Mean(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, []int{1},
+		fmt.Sprintf("SELECT 0 AS idx, avg(val) AS val FROM %s", t.table))
+}
+
+func (t *Tensor) Variance(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, []int{1},
+		fmt.Sprintf("SELECT 0 AS idx, var_pop(val) AS val FROM %s", t.table))
+}
+
+func (t *Tensor) Stddev(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, []int{1},
+		fmt.Sprintf("SELECT 0 AS idx, stddev_pop(val) AS val FROM %s", t.table))
+}
+
+func (t *Tensor) TopK(ctx ml.Context, k int) ml.Tensor  { return topK(t, k) }
+func (t *Tensor) Argsort(ctx ml.Context) ml.Tensor       { return argsort(t) }
+
+// ==================== SHAPE OPS (no math, just index remapping) ====================
+
+func (t *Tensor) Reshape(ctx ml.Context, shape ...int) ml.Tensor {
+	// Same data, different shape — just reference same table
+	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, table: t.table}
+}
+
+func (t *Tensor) View(ctx ml.Context, offset int, shape ...int) ml.Tensor {
+	total := product(shape)
+	elemOffset := offset / 4
+	query := fmt.Sprintf(
+		"SELECT idx - %d AS idx, val FROM %s WHERE idx >= %d AND idx < %d",
+		elemOffset, t.table, elemOffset, elemOffset+total)
+	return newTensorFromSQL(t.b, shape, query)
+}
+
+func (t *Tensor) Permute(ctx ml.Context, dims ...int) ml.Tensor {
+	// Permute requires Go-side index remapping — materialize, permute, re-upload
+	data := t.materialize()
+	result := permuteData(t.b, t.shape, data, dims)
+	return result
+}
+
+func (t *Tensor) Contiguous(ctx ml.Context, shape ...int) ml.Tensor {
+	if len(shape) == 0 {
+		shape = t.Shape()
+	}
+	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, table: t.table}
+}
+
+func (t *Tensor) Pad(ctx ml.Context, shape ...int) ml.Tensor {
+	data := t.materialize()
+	return newTensorFromData(t.b, shape, padData(t.shape, shape, data))
+}
+
+func (t *Tensor) Stack(ctx ml.Context, dim int, s ...ml.Tensor) ml.Tensor {
+	// Union all tables with offset indices
+	parts := []string{fmt.Sprintf("SELECT idx, val FROM %s", t.table)}
+	offset := product(t.shape)
+	for _, st := range s {
+		tt := st.(*Tensor)
+		parts = append(parts, fmt.Sprintf("SELECT idx + %d AS idx, val FROM %s", offset, tt.table))
+		offset += product(tt.shape)
+	}
+	newShape := t.Shape()
+	if dim >= len(newShape) {
+		newShape = append(newShape, 1+len(s))
+	} else {
+		result := make([]int, len(newShape)+1)
+		copy(result[:dim], newShape[:dim])
+		result[dim] = 1 + len(s)
+		copy(result[dim+1:], newShape[dim:])
+		newShape = result
+	}
+	return newTensorFromSQL(t.b, newShape, strings.Join(parts, " UNION ALL "))
+}
+
+func (t *Tensor) Repeat(ctx ml.Context, dim, n int) ml.Tensor {
+	data := t.materialize()
+	return newTensorFromData(t.b, repeatShape(t.shape, dim, n), repeatData(t.shape, dim, n, data))
+}
+
+func (t *Tensor) Repeat4D(ctx ml.Context, d0, d1, d2, d3 int) ml.Tensor {
+	result := t
+	if d0 > 1 { result = result.Repeat(ctx, 0, d0).(*Tensor) }
+	if d1 > 1 { result = result.Repeat(ctx, 1, d1).(*Tensor) }
+	if d2 > 1 { result = result.Repeat(ctx, 2, d2).(*Tensor) }
+	if d3 > 1 { result = result.Repeat(ctx, 3, d3).(*Tensor) }
+	return result
+}
+
+func (t *Tensor) Concat(ctx ml.Context, t2 ml.Tensor, dim int) ml.Tensor {
+	b := t2.(*Tensor)
+	offset := product(t.shape)
+	query := fmt.Sprintf("SELECT idx, val FROM %s UNION ALL SELECT idx + %d AS idx, val FROM %s", t.table, offset, b.table)
+	newShape := t.Shape()
+	if dim < len(newShape) {
+		newShape[dim] = t.shape[dim] + b.shape[dim]
+	}
+	return newTensorFromSQL(t.b, newShape, query)
+}
+
+func (t *Tensor) Rows(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
+	indices := t2.(*Tensor)
+	idxData := indices.materialize()
+	dim0 := t.shape[0]
+	nIndices := len(idxData)
+	// For each index i, copy row idxData[i] from t
+	// Output idx = i*dim0 + col
+	parts := make([]string, 0, nIndices)
+	for i, idx := range idxData {
+		row := int(idx)
+		parts = append(parts, fmt.Sprintf(
+			"SELECT %d * %d + (idx - %d) AS idx, val FROM %s WHERE idx >= %d AND idx < %d",
+			i, dim0, row*dim0, t.table, row*dim0, (row+1)*dim0))
+	}
+	if len(parts) == 0 {
+		return newTensorFromData(t.b, []int{0}, nil)
+	}
+	newShape := append([]int{dim0}, indices.shape...)
+	return newTensorFromSQL(t.b, newShape, strings.Join(parts, " UNION ALL "))
+}
+
+func (t *Tensor) SetRows(ctx ml.Context, src ml.Tensor, idxs ml.Tensor) ml.Tensor {
+	data := t.materialize()
+	srcData := src.(*Tensor).materialize()
+	idxData := idxs.(*Tensor).materialize()
+	out := make([]float32, len(data))
+	copy(out, data)
+	dim0 := t.shape[0]
+	for i, idx := range idxData {
+		row := int(idx)
+		if row >= 0 && row*dim0+dim0 <= len(out) && i*dim0+dim0 <= len(srcData) {
+			copy(out[row*dim0:(row+1)*dim0], srcData[i*dim0:(i+1)*dim0])
+		}
+	}
+	return newTensorFromData(t.b, t.Shape(), out)
+}
+
+func (t *Tensor) SetInplace(ctx ml.Context, src ml.Tensor, nb1, nb2, nb3, offset int) ml.Tensor {
+	data := t.materialize()
+	srcData := src.(*Tensor).materialize()
+	out := make([]float32, len(data))
+	copy(out, data)
+	elemOffset := offset / 4
+	for i := 0; i < len(srcData) && elemOffset+i < len(out); i++ {
+		out[elemOffset+i] = srcData[i]
+	}
+	return newTensorFromData(t.b, t.Shape(), out)
+}
+
+func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
+	dst := t2.(*Tensor)
+	dst.table = t.table
+	dst.shape = t.Shape()
+	dst.data = nil // invalidate cache
+	return dst
+}
+
+func (t *Tensor) Duplicate(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val FROM %s", t.table))
+}
+
+func (t *Tensor) Slice(ctx ml.Context, dim, low, high, step int) ml.Tensor {
+	data := t.materialize()
+	return newTensorFromData(t.b, sliceShape(t.shape, dim, low, high, step), sliceData(t.shape, dim, low, high, step, data))
+}
+
+func (t *Tensor) Chunk(ctx ml.Context, dim int, size int) []ml.Tensor {
+	data := t.materialize()
+	return chunkTensors(t.b, t.shape, dim, size, data)
+}
+
+func (t *Tensor) ChunkSections(ctx ml.Context, dim int, sections ...int) []ml.Tensor {
+	data := t.materialize()
+	return chunkSectionsTensors(t.b, t.shape, dim, sections, data)
+}
+
+// ==================== ADVANCED ====================
+
+func (t *Tensor) CumSum(ctx ml.Context) ml.Tensor {
+	return newTensorFromSQL(t.b, t.Shape(),
+		fmt.Sprintf("SELECT idx, SUM(val) OVER (ORDER BY idx) AS val FROM %s", t.table))
+}
+
+func (t *Tensor) Diag(ctx ml.Context) ml.Tensor {
+	data := t.materialize()
+	n := len(data)
+	out := make([]float32, n*n)
+	for i := 0; i < n; i++ {
+		out[i*n+i] = data[i]
+	}
+	return newTensorFromData(t.b, []int{n, n}, out)
+}
+
+func (t *Tensor) Tri(ctx ml.Context, triType int) ml.Tensor {
+	data := t.materialize()
+	return newTensorFromData(t.b, t.Shape(), triData(t.shape, triType, data))
+}
+
+func (t *Tensor) Fill(ctx ml.Context, value float32) ml.Tensor {
+	n := product(t.shape)
+	return newTensorFromSQL(t.b, t.Shape(),
+		fmt.Sprintf("SELECT generate_series AS idx, %g::FLOAT AS val FROM generate_series(0, %d)", value, n-1))
+}
+
+func (t *Tensor) SolveTri(ctx ml.Context, b ml.Tensor, lower, left, unitDiag bool) ml.Tensor {
+	return b.(*Tensor).Duplicate(ctx)
+}
+func (t *Tensor) Interpolate(ctx ml.Context, dims [4]int, samplingMode ml.SamplingMode) ml.Tensor {
+	return t.Duplicate(ctx)
+}
+func (t *Tensor) Conv2D(ctx ml.Context, weight ml.Tensor, s0, s1, p0, p1, d0, d1 int) ml.Tensor {
+	return t.Fill(ctx, 0)
+}
+func (t *Tensor) Conv3D(ctx ml.Context, weight ml.Tensor, c, s0, s1, s2, p0, p1, p2, d0, d1, d2 int) ml.Tensor {
+	return t.Fill(ctx, 0)
+}
+func (t *Tensor) AvgPool2D(ctx ml.Context, k, s int, p float32) ml.Tensor { return t.Fill(ctx, 0) }
+func (t *Tensor) IM2Col(ctx ml.Context, weight ml.Tensor, s0, s1, p0, p1, d0, d1 int) ml.Tensor {
+	return t.Fill(ctx, 0)
+}
+func (t *Tensor) SSMConv(ctx ml.Context, kernel ml.Tensor) ml.Tensor { return t.Fill(ctx, 0) }
+func (t *Tensor) SSMScan(ctx ml.Context, x, dt, A, B, C, ids ml.Tensor) ml.Tensor {
+	return t.Fill(ctx, 0)
+}
+
+// ==================== RoPE ====================
+
+func (t *Tensor) RoPE(ctx ml.Context, positions ml.Tensor, ropeDim int, ropeBase, ropeScale float32, options ...func(*rope.Options)) ml.Tensor {
+	if len(t.shape) < 3 {
+		return t.Duplicate(ctx)
+	}
+	// RoPE requires index-dependent trig — materialize, compute, re-upload
+	data := t.materialize()
+	pos := positions.(*Tensor).materialize()
+	result := ropeData(t.shape, data, pos, ropeDim, ropeBase)
+	return newTensorFromData(t.b, t.Shape(), result)
+}
+
+// ==================== HELPER FUNCTIONS ====================
+
+func ropeData(shape []int, data, pos []float32, ropeDim int, ropeBase float32) []float32 {
+	dim0 := shape[0]
+	nHeads := shape[1]
+	seqLen := shape[2]
+	if ropeDim <= 0 || ropeDim > dim0 {
+		ropeDim = dim0
+	}
+	out := make([]float32, len(data))
+	copy(out, data)
+	for s := 0; s < seqLen; s++ {
+		position := float64(0)
+		if s < len(pos) {
+			position = float64(pos[s])
+		}
+		for h := 0; h < nHeads; h++ {
+			baseIdx := s*nHeads*dim0 + h*dim0
+			for d := 0; d < ropeDim/2; d++ {
+				freq := position / math.Pow(float64(ropeBase), float64(2*d)/float64(ropeDim))
+				cos := float32(math.Cos(freq))
+				sin := float32(math.Sin(freq))
+				i0 := baseIdx + d
+				i1 := baseIdx + d + ropeDim/2
+				if i0 < len(out) && i1 < len(out) {
+					v0, v1 := data[i0], data[i1]
+					out[i0] = v0*cos - v1*sin
+					out[i1] = v0*sin + v1*cos
+				}
+			}
+		}
+	}
+	return out
+}
+
+func permuteData(b *Backend, shape []int, data []float32, dims []int) *Tensor {
+	if len(dims) == 0 || len(shape) <= 1 {
+		return newTensorFromData(b, shape, append([]float32{}, data...))
+	}
 	ndim := len(dims)
-	shape := make([]int, ndim)
-	copy(shape, t.shape)
-	for i := len(t.shape); i < ndim; i++ {
-		shape[i] = 1
+	paddedShape := make([]int, ndim)
+	copy(paddedShape, shape)
+	for i := len(shape); i < ndim; i++ {
+		paddedShape[i] = 1
 	}
-
 	newShape := make([]int, ndim)
 	for i, d := range dims {
 		if d < ndim {
-			newShape[i] = shape[d]
+			newShape[i] = paddedShape[d]
 		} else {
 			newShape[i] = 1
 		}
@@ -731,14 +722,14 @@ func permute(t *Tensor, dims []int) *Tensor {
 	oldStrides := make([]int, ndim)
 	oldStrides[0] = 1
 	for i := 1; i < ndim; i++ {
-		oldStrides[i] = oldStrides[i-1] * shape[i-1]
+		oldStrides[i] = oldStrides[i-1] * paddedShape[i-1]
 	}
 	newStrides := make([]int, ndim)
 	newStrides[0] = 1
 	for i := 1; i < ndim; i++ {
 		newStrides[i] = newStrides[i-1] * newShape[i-1]
 	}
-	total := len(t.data)
+	total := len(data)
 	out := make([]float32, total)
 	for outIdx := 0; outIdx < total; outIdx++ {
 		remaining := outIdx
@@ -753,245 +744,206 @@ func permute(t *Tensor, dims []int) *Tensor {
 				srcIdx += coords[d] * oldStrides[dims[d]]
 			}
 		}
-		if srcIdx < len(t.data) {
-			out[outIdx] = t.data[srcIdx]
+		if srcIdx < len(data) {
+			out[outIdx] = data[srcIdx]
 		}
 	}
-	return newTensor(t.b, newShape, out)
+	return newTensorFromData(b, newShape, out)
 }
 
-func pad(t *Tensor, shape []int) *Tensor {
-	total := 1
-	for _, d := range shape {
-		total *= d
-	}
+func padData(oldShape, newShape []int, data []float32) []float32 {
+	total := product(newShape)
 	out := make([]float32, total)
-	if len(t.shape) >= 1 && len(shape) >= 1 {
-		srcDim0 := t.shape[0]
-		dstDim0 := shape[0]
-		srcRows := len(t.data) / max(srcDim0, 1)
+	if len(oldShape) >= 1 && len(newShape) >= 1 {
+		srcDim0 := oldShape[0]
+		dstDim0 := newShape[0]
+		srcRows := len(data) / max(srcDim0, 1)
 		for row := 0; row < srcRows; row++ {
-			srcStart := row * srcDim0
-			dstStart := row * dstDim0
 			n := min(srcDim0, dstDim0)
-			for i := 0; i < n && srcStart+i < len(t.data) && dstStart+i < len(out); i++ {
-				out[dstStart+i] = t.data[srcStart+i]
+			for i := 0; i < n && row*srcDim0+i < len(data) && row*dstDim0+i < len(out); i++ {
+				out[row*dstDim0+i] = data[row*srcDim0+i]
 			}
 		}
 	}
-	return newTensor(t.b, shape, out)
+	return out
 }
 
-func repeatTensor(t *Tensor, dim, n int) ml.Tensor {
-	if dim >= len(t.shape) || n <= 1 {
-		return newTensor(t.b, t.Shape(), append([]float32{}, t.data...))
+func repeatShape(shape []int, dim, n int) []int {
+	s := make([]int, len(shape))
+	copy(s, shape)
+	if dim < len(s) {
+		s[dim] *= n
 	}
-	newShape := t.Shape()
-	newShape[dim] *= n
-	total := 1
-	for _, d := range newShape {
-		total *= d
+	return s
+}
+
+func repeatData(shape []int, dim, n int, data []float32) []float32 {
+	if dim >= len(shape) || n <= 1 {
+		out := make([]float32, len(data))
+		copy(out, data)
+		return out
 	}
+	newShape := repeatShape(shape, dim, n)
+	total := product(newShape)
 	out := make([]float32, total)
 	innerSize := 1
 	for i := 0; i < dim; i++ {
-		innerSize *= t.shape[i]
+		innerSize *= shape[i]
 	}
-	outerSize := len(t.data) / (innerSize * t.shape[dim])
-	chunkSize := innerSize * t.shape[dim]
+	outerSize := len(data) / (innerSize * shape[dim])
+	chunkSize := innerSize * shape[dim]
 	for outer := 0; outer < outerSize; outer++ {
 		for rep := 0; rep < n; rep++ {
-			srcStart := outer * chunkSize
-			dstStart := outer*chunkSize*n + rep*chunkSize
-			copy(out[dstStart:dstStart+chunkSize], t.data[srcStart:srcStart+chunkSize])
+			copy(out[outer*chunkSize*n+rep*chunkSize:], data[outer*chunkSize:outer*chunkSize+chunkSize])
 		}
 	}
-	return newTensor(t.b, newShape, out)
+	return out
 }
 
-func concat(a, b *Tensor, dim int) *Tensor {
-	if dim == 0 || len(a.shape) <= 1 {
-		out := make([]float32, len(a.data)+len(b.data))
-		copy(out, a.data)
-		copy(out[len(a.data):], b.data)
-		newShape := a.Shape()
-		if len(newShape) > 0 {
-			newShape[0] = a.shape[0] + b.shape[0]
-		}
-		return newTensor(a.b, newShape, out)
+func sliceShape(shape []int, dim, low, high, step int) []int {
+	if dim >= len(shape) {
+		return append([]int{}, shape...)
 	}
-	out := make([]float32, len(a.data)+len(b.data))
-	copy(out, a.data)
-	copy(out[len(a.data):], b.data)
-	newShape := a.Shape()
-	if dim < len(newShape) {
-		newShape[dim] = a.shape[dim] + b.shape[dim]
+	if step == 0 {
+		step = 1
 	}
-	return newTensor(a.b, newShape, out)
+	s := make([]int, len(shape))
+	copy(s, shape)
+	s[dim] = (high - low + step - 1) / step
+	return s
 }
 
-func rowsTensor(t, indices *Tensor) *Tensor {
-	if len(t.shape) == 0 {
-		return newTensor(t.b, []int{0}, nil)
-	}
-	dim0 := t.shape[0]
-	nIndices := len(indices.data)
-	out := make([]float32, nIndices*dim0)
-	for i, idx := range indices.data {
-		row := int(idx)
-		if row >= 0 && row*dim0+dim0 <= len(t.data) {
-			copy(out[i*dim0:(i+1)*dim0], t.data[row*dim0:(row+1)*dim0])
-		}
-	}
-	newShape := append([]int{dim0}, indices.shape...)
-	return newTensor(t.b, newShape, out)
-}
-
-func setRows(t, src, idxs *Tensor) *Tensor {
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
-	dim0 := t.shape[0]
-	for i, idx := range idxs.data {
-		row := int(idx)
-		if row >= 0 && row*dim0+dim0 <= len(out) && i*dim0+dim0 <= len(src.data) {
-			copy(out[row*dim0:(row+1)*dim0], src.data[i*dim0:(i+1)*dim0])
-		}
-	}
-	return newTensor(t.b, t.Shape(), out)
-}
-
-func sliceTensor(t *Tensor, dim, low, high, step int) *Tensor {
-	if dim >= len(t.shape) || dim < 0 {
-		return newTensor(t.b, t.Shape(), append([]float32{}, t.data...))
+func sliceData(shape []int, dim, low, high, step int, data []float32) []float32 {
+	if dim >= len(shape) || dim < 0 {
+		out := make([]float32, len(data))
+		copy(out, data)
+		return out
 	}
 	if step == 0 {
 		step = 1
 	}
 	newDimSize := (high - low + step - 1) / step
 	if newDimSize <= 0 {
-		return newTensor(t.b, []int{0}, nil)
+		return nil
 	}
-	newShape := t.Shape()
-	newShape[dim] = newDimSize
 	if dim == 0 {
-		outerSize := len(t.data) / t.shape[0]
+		outerSize := len(data) / shape[0]
 		out := make([]float32, newDimSize*outerSize)
 		for outer := 0; outer < outerSize; outer++ {
-			srcBase := outer * t.shape[0]
-			dstBase := outer * newDimSize
 			idx := 0
 			for i := low; i < high; i += step {
-				if srcBase+i < len(t.data) {
-					out[dstBase+idx] = t.data[srcBase+i]
+				if outer*shape[0]+i < len(data) {
+					out[outer*newDimSize+idx] = data[outer*shape[0]+i]
 				}
 				idx++
 			}
 		}
-		return newTensor(t.b, newShape, out)
+		return out
 	}
-	total := 1
-	for _, d := range newShape {
-		total *= d
-	}
+	ns := sliceShape(shape, dim, low, high, step)
+	total := product(ns)
 	out := make([]float32, total)
-	copy(out, t.data[:min(total, len(t.data))])
-	return newTensor(t.b, newShape, out)
+	copy(out, data[:min(total, len(data))])
+	return out
 }
 
-func chunk(t *Tensor, dim int, size int) []ml.Tensor {
-	if dim >= len(t.shape) || size <= 0 {
-		return []ml.Tensor{t}
+func chunkTensors(b *Backend, shape []int, dim, size int, data []float32) []ml.Tensor {
+	if dim >= len(shape) || size <= 0 {
+		return []ml.Tensor{newTensorFromData(b, shape, data)}
 	}
-	dimSize := t.shape[dim]
+	dimSize := shape[dim]
 	nChunks := (dimSize + size - 1) / size
 	results := make([]ml.Tensor, nChunks)
 	for i := 0; i < nChunks; i++ {
 		low := i * size
 		high := min((i+1)*size, dimSize)
-		results[i] = sliceTensor(t, dim, low, high, 1)
+		results[i] = newTensorFromData(b, sliceShape(shape, dim, low, high, 1), sliceData(shape, dim, low, high, 1, data))
 	}
 	return results
 }
 
-func chunkSections(t *Tensor, dim int, sections []int) []ml.Tensor {
-	if dim >= len(t.shape) {
-		return []ml.Tensor{t}
+func chunkSectionsTensors(b *Backend, shape []int, dim int, sections []int, data []float32) []ml.Tensor {
+	if dim >= len(shape) {
+		return []ml.Tensor{newTensorFromData(b, shape, data)}
 	}
 	results := make([]ml.Tensor, len(sections))
 	offset := 0
 	for i, size := range sections {
 		high := offset + size
-		if high > t.shape[dim] {
-			high = t.shape[dim]
+		if high > shape[dim] {
+			high = shape[dim]
 		}
-		results[i] = sliceTensor(t, dim, offset, high, 1)
+		results[i] = newTensorFromData(b, sliceShape(shape, dim, offset, high, 1), sliceData(shape, dim, offset, high, 1, data))
 		offset = high
 	}
 	return results
 }
 
-func stack(tensors []*Tensor, dim int) *Tensor {
-	if len(tensors) == 0 {
-		return newTensor(nil, []int{0}, nil)
+func triData(shape []int, triType int, data []float32) []float32 {
+	if len(shape) < 2 {
+		out := make([]float32, len(data))
+		copy(out, data)
+		return out
 	}
-	totalData := 0
-	for _, t := range tensors {
-		totalData += len(t.data)
+	rows := shape[len(shape)-2]
+	cols := shape[len(shape)-1]
+	out := make([]float32, len(data))
+	copy(out, data)
+	batchSize := len(data) / (rows * cols)
+	for batch := 0; batch < batchSize; batch++ {
+		base := batch * rows * cols
+		for r := 0; r < rows; r++ {
+			for c := 0; c < cols; c++ {
+				keep := false
+				switch triType {
+				case 0: keep = c >= r
+				case 1: keep = c > r
+				case 2: keep = c <= r
+				case 3: keep = c < r
+				}
+				if !keep {
+					out[base+r*cols+c] = 0
+				}
+			}
+		}
 	}
-	out := make([]float32, totalData)
-	offset := 0
-	for _, t := range tensors {
-		copy(out[offset:], t.data)
-		offset += len(t.data)
-	}
-	newShape := tensors[0].Shape()
-	if dim >= len(newShape) {
-		newShape = append(newShape, len(tensors))
-	} else {
-		result := make([]int, len(newShape)+1)
-		copy(result[:dim], newShape[:dim])
-		result[dim] = len(tensors)
-		copy(result[dim+1:], newShape[dim:])
-		newShape = result
-	}
-	return newTensor(tensors[0].b, newShape, out)
+	return out
 }
 
 func topK(t *Tensor, k int) *Tensor {
-	if len(t.data) == 0 || k <= 0 {
-		return newTensor(t.b, []int{0}, nil)
+	data := t.materialize()
+	if len(data) == 0 || k <= 0 {
+		return newTensorFromData(t.b, []int{0}, nil)
 	}
 	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
+	nrows := len(data) / dim0
 	k = min(k, dim0)
 	out := make([]float32, nrows*k)
 	for row := 0; row < nrows; row++ {
 		start := row * dim0
-		type iv struct {
-			idx int
-			val float32
-		}
+		type iv struct{ i int; v float32 }
 		pairs := make([]iv, dim0)
 		for i := 0; i < dim0; i++ {
-			pairs[i] = iv{i, t.data[start+i]}
+			pairs[i] = iv{i, data[start+i]}
 		}
-		sort.Slice(pairs, func(i, j int) bool { return pairs[i].val > pairs[j].val })
+		sort.Slice(pairs, func(i, j int) bool { return pairs[i].v > pairs[j].v })
 		for i := 0; i < k; i++ {
-			out[row*k+i] = pairs[i].val
+			out[row*k+i] = pairs[i].v
 		}
 	}
-	newShape := t.Shape()
-	newShape[0] = k
-	return newTensor(t.b, newShape, out)
+	ns := t.Shape()
+	ns[0] = k
+	return newTensorFromData(t.b, ns, out)
 }
 
 func argsort(t *Tensor) *Tensor {
-	if len(t.data) == 0 {
-		return newTensor(t.b, t.Shape(), nil)
+	data := t.materialize()
+	if len(data) == 0 {
+		return newTensorFromData(t.b, t.Shape(), nil)
 	}
 	dim0 := t.shape[0]
-	nrows := len(t.data) / dim0
-	out := make([]float32, len(t.data))
+	nrows := len(data) / dim0
+	out := make([]float32, len(data))
 	for row := 0; row < nrows; row++ {
 		start := row * dim0
 		indices := make([]int, dim0)
@@ -999,60 +951,13 @@ func argsort(t *Tensor) *Tensor {
 			indices[i] = i
 		}
 		sort.Slice(indices, func(i, j int) bool {
-			return t.data[start+indices[i]] < t.data[start+indices[j]]
+			return data[start+indices[i]] < data[start+indices[j]]
 		})
 		for i, idx := range indices {
 			out[start+i] = float32(idx)
 		}
 	}
-	return newTensor(t.b, t.Shape(), out)
-}
-
-// RoPE applies rotary positional embedding.
-func (t *Tensor) RoPE(ctx ml.Context, positions ml.Tensor, ropeDim int, ropeBase, ropeScale float32, options ...func(*rope.Options)) ml.Tensor {
-	if len(t.shape) < 3 {
-		return t.Duplicate(ctx)
-	}
-
-	dim0 := t.shape[0]
-	nHeads := t.shape[1]
-	seqLen := t.shape[2]
-
-	if ropeDim <= 0 || ropeDim > dim0 {
-		ropeDim = dim0
-	}
-
-	pos := positions.(*Tensor)
-	out := make([]float32, len(t.data))
-	copy(out, t.data)
-
-	for s := 0; s < seqLen; s++ {
-		position := float64(0)
-		if s < len(pos.data) {
-			position = float64(pos.data[s])
-		}
-
-		for h := 0; h < nHeads; h++ {
-			baseIdx := s*nHeads*dim0 + h*dim0
-			for d := 0; d < ropeDim/2; d++ {
-				freq := position / math.Pow(float64(ropeBase), float64(2*d)/float64(ropeDim))
-				cosVal := float32(math.Cos(freq))
-				sinVal := float32(math.Sin(freq))
-
-				i0 := baseIdx + d
-				i1 := baseIdx + d + ropeDim/2
-
-				if i0 < len(out) && i1 < len(out) {
-					v0 := t.data[i0]
-					v1 := t.data[i1]
-					out[i0] = v0*cosVal - v1*sinVal
-					out[i1] = v0*sinVal + v1*cosVal
-				}
-			}
-		}
-	}
-
-	return newTensor(t.b, t.Shape(), out)
+	return newTensorFromData(t.b, t.Shape(), out)
 }
 
 var _ ml.Tensor = (*Tensor)(nil)

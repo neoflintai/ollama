@@ -286,13 +286,9 @@ func (b *Backend) loadAllTensorsFromDB(progress func(float32)) error {
 			return fmt.Errorf("parse shape for %s: %w", name, err)
 		}
 
-		t := &Tensor{
-			b:     b,
-			name:  name,
-			shape: shape,
-			dtype: ml.DType(dtype),
-			data:  bytesToFloat32(data),
-		}
+		t := newTensorFromData(b, shape, bytesToFloat32(data))
+		t.name = name
+		t.dtype = ml.DType(dtype)
 
 		b.mu.Lock()
 		b.tensors[name] = t
@@ -323,117 +319,10 @@ func (b *Backend) loadTensorFromDB(name string) (*Tensor, error) {
 		return nil, err
 	}
 
-	return &Tensor{
-		b:     b,
-		name:  name,
-		shape: shape,
-		dtype: ml.DType(dtype),
-		data:  bytesToFloat32(data),
-	}, nil
-}
-
-// matmulDuckDB performs matrix multiplication using DuckDB's vectorized engine.
-// It stores the two input matrices as temporary tables, runs a SQL join+aggregate,
-// and reads back the result. This leverages DuckDB's columnar execution and SIMD.
-func (b *Backend) matmulDuckDB(a, bT *Tensor) *Tensor {
-	if len(a.shape) < 2 || len(bT.shape) < 2 {
-		// 1D dot product fallback
-		n := min(len(a.data), len(bT.data))
-		var sum float32
-		for i := 0; i < n; i++ {
-			sum += a.data[i] * bT.data[i]
-		}
-		return newTensor(a.b, []int{1}, []float32{sum})
-	}
-
-	// GGML convention: C = A^T * B
-	// A shape: [K, M], B shape: [K, N]
-	// Result: [M, N]
-	K := a.shape[0]
-	M := a.shape[1]
-	N := bT.shape[1]
-
-	// For small matrices, pure Go is faster than SQL overhead
-	if M*N*K < 100000 {
-		return matmulGo(a, bT)
-	}
-
-	// Use DuckDB for large matmuls
-	// Create temporary unnested arrays for vectorized dot products
-	tx, err := b.db.Begin()
-	if err != nil {
-		return matmulGo(a, bT)
-	}
-	defer tx.Rollback()
-
-	// Create temp tables with row/col structure for the matrices
-	if _, err := tx.Exec(`
-		CREATE TEMPORARY TABLE IF NOT EXISTS _mat_a (row_idx INTEGER, col_idx INTEGER, val FLOAT);
-		CREATE TEMPORARY TABLE IF NOT EXISTS _mat_b (row_idx INTEGER, col_idx INTEGER, val FLOAT);
-		DELETE FROM _mat_a; DELETE FROM _mat_b;
-	`); err != nil {
-		return matmulGo(a, bT)
-	}
-
-	// Batch insert A[i,k] values — A is [K,M] col-major, so A[k,i] = a.data[i*K+k]
-	stmtA, err := tx.Prepare("INSERT INTO _mat_a VALUES (?, ?, ?)")
-	if err != nil {
-		return matmulGo(a, bT)
-	}
-
-	for i := 0; i < M; i++ {
-		for k := 0; k < K; k++ {
-			if _, err := stmtA.Exec(i, k, a.data[i*K+k]); err != nil {
-				stmtA.Close()
-				return matmulGo(a, bT)
-			}
-		}
-	}
-	stmtA.Close()
-
-	// Batch insert B[j,k] values — B is [K,N] col-major, so B[k,j] = b.data[j*K+k]
-	stmtB, err := tx.Prepare("INSERT INTO _mat_b VALUES (?, ?, ?)")
-	if err != nil {
-		return matmulGo(a, bT)
-	}
-
-	for j := 0; j < N; j++ {
-		for k := 0; k < K; k++ {
-			if _, err := stmtB.Exec(j, k, bT.data[j*K+k]); err != nil {
-				stmtB.Close()
-				return matmulGo(a, bT)
-			}
-		}
-	}
-	stmtB.Close()
-
-	// Vectorized matmul: C[i,j] = SUM(A[i,k] * B[j,k]) over k
-	rows, err := tx.Query(`
-		SELECT a.row_idx, b.row_idx, SUM(a.val * b.val)
-		FROM _mat_a a JOIN _mat_b b ON a.col_idx = b.col_idx
-		GROUP BY a.row_idx, b.row_idx
-		ORDER BY b.row_idx, a.row_idx
-	`)
-	if err != nil {
-		return matmulGo(a, bT)
-	}
-	defer rows.Close()
-
-	out := make([]float32, M*N)
-	for rows.Next() {
-		var i, j int
-		var val float64
-		if err := rows.Scan(&i, &j, &val); err != nil {
-			return matmulGo(a, bT)
-		}
-		if j*M+i < len(out) {
-			out[j*M+i] = float32(val)
-		}
-	}
-
-	tx.Exec("DROP TABLE IF EXISTS _mat_a; DROP TABLE IF EXISTS _mat_b")
-
-	return newTensor(a.b, []int{M, N}, out)
+	t := newTensorFromData(b, shape, bytesToFloat32(data))
+	t.name = name
+	t.dtype = ml.DType(dtype)
+	return t, nil
 }
 
 func float32ToBytes(f []float32) []byte {

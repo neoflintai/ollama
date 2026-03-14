@@ -126,14 +126,24 @@ func TestMatmulDuckDB(t *testing.T) {
 		bData[i] = float32(i%11) * 0.1
 	}
 
-	a := &Tensor{b: b, shape: []int{K, M}, dtype: ml.DTypeF32, data: aData}
-	bT := &Tensor{b: b, shape: []int{K, N}, dtype: ml.DTypeF32, data: bData}
+	a := newTensorFromData(b, []int{K, M}, aData)
+	bT := newTensorFromData(b, []int{K, N}, bData)
 
-	// Get DuckDB result
-	duckResult := b.matmulDuckDB(a, bT)
+	// Get DuckDB SQL result (all computation in DuckDB)
+	duckResult := matmulSQL(a, bT)
 
-	// Get pure Go result for comparison
-	goResult := matmulGo(a, bT)
+	// Compute expected result in pure Go for comparison
+	goData := make([]float32, M*N)
+	for j := 0; j < N; j++ {
+		for i := 0; i < M; i++ {
+			var sum float32
+			for k := 0; k < K; k++ {
+				sum += aData[i*K+k] * bData[j*K+k]
+			}
+			goData[j*M+i] = sum
+		}
+	}
+	goResult := newTensorFromData(b, []int{M, N}, goData)
 
 	duckFloats := duckResult.Floats()
 	goFloats := goResult.Floats()
