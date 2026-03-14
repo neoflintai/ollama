@@ -1229,12 +1229,27 @@ func (s *Server) allocModel(
 	s.seqs = make([]*Sequence, s.parallel)
 	s.seqsSem = semaphore.NewWeighted(int64(s.parallel))
 
-	err = s.reserveWorstCaseGraph(true)
-	if err != nil {
-		return nil
+	// Skip worst-case graph reservation for non-GPU backends (sqlite, duckdb)
+	// — it runs a full forward pass just to estimate GPU memory, which is pointless for CPU-only backends
+	devices := s.model.Backend().BackendDevices()
+	needsReserve := true
+	if len(devices) > 0 {
+		lib := devices[0].Library
+		if lib == "sqlite" || lib == "duckdb" {
+			needsReserve = false
+		}
 	}
 
-	return s.reserveWorstCaseGraph(false)
+	if needsReserve {
+		err = s.reserveWorstCaseGraph(true)
+		if err != nil {
+			return nil
+		}
+
+		return s.reserveWorstCaseGraph(false)
+	}
+
+	return nil
 }
 
 // closeModel frees all memory associated with a model

@@ -85,13 +85,21 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 		return nil, fmt.Errorf("duckdb schema: %w", err)
 	}
 
-	return &Backend{
+	b := &Backend{
 		db:        db,
 		dbPath:    dbPath,
 		modelPath: modelPath,
 		meta:      meta,
 		tensors:   make(map[string]*Tensor),
-	}, nil
+	}
+
+	// Import and load all tensors eagerly so Get() works immediately
+	if err := b.Load(context.Background(), nil); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("duckdb load: %w", err)
+	}
+
+	return b, nil
 }
 
 func (b *Backend) Close() {
@@ -113,6 +121,8 @@ func (b *Backend) BackendDevices() []ml.DeviceInfo {
 		DeviceID:    ml.DeviceID{ID: "duckdb-cpu-0", Library: "duckdb"},
 		Name:        "duckdb-cpu",
 		Description: "DuckDB columnar CPU backend",
+		TotalMemory: 16 * 1024 * 1024 * 1024, // report 16GB so scheduler doesn't reject
+		FreeMemory:  16 * 1024 * 1024 * 1024,
 	}}
 }
 

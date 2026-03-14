@@ -5,6 +5,7 @@ import (
 	"sort"
 
 	"github.com/ollama/ollama/ml"
+	"github.com/ollama/ollama/ml/nn/rope"
 )
 
 // Tensor stores data as float32 slices, backed by SQLite for persistence.
@@ -621,11 +622,16 @@ func matmul(a, b *Tensor) *Tensor {
 			for i := 0; i < M; i++ {
 				var sum float32
 				for k := 0; k < K; k++ {
-					// A[k, i] = a.data[offA + i*K + k]
-					// B[k, j] = b.data[offB + j*K + k]
-					sum += a.data[offA+i*K+k] * b.data[offB+j*K+k]
+					ai := offA + i*K + k
+					bi := offB + j*K + k
+					if ai < len(a.data) && bi < len(b.data) {
+						sum += a.data[ai] * b.data[bi]
+					}
 				}
-				out[offC+j*M+i] = sum
+				ci := offC + j*M + i
+				if ci < len(out) {
+					out[ci] = sum
+				}
 			}
 		}
 	}
@@ -799,11 +805,20 @@ func permute(t *Tensor, dims []int) *Tensor {
 		return newTensor(t.b, t.Shape(), append([]float32{}, t.data...))
 	}
 
-	ndim := len(t.shape)
+	// Pad shape to match dims length if needed
+	ndim := len(dims)
+	shape := make([]int, ndim)
+	copy(shape, t.shape)
+	for i := len(t.shape); i < ndim; i++ {
+		shape[i] = 1
+	}
+
 	newShape := make([]int, ndim)
 	for i, d := range dims {
-		if i < ndim && d < ndim {
-			newShape[i] = t.shape[d]
+		if d < ndim {
+			newShape[i] = shape[d]
+		} else {
+			newShape[i] = 1
 		}
 	}
 
@@ -811,7 +826,7 @@ func permute(t *Tensor, dims []int) *Tensor {
 	oldStrides := make([]int, ndim)
 	oldStrides[0] = 1
 	for i := 1; i < ndim; i++ {
-		oldStrides[i] = oldStrides[i-1] * t.shape[i-1]
+		oldStrides[i] = oldStrides[i-1] * shape[i-1]
 	}
 
 	// Compute strides for new shape
@@ -1136,6 +1151,56 @@ func argsort(t *Tensor) *Tensor {
 		})
 		for i, idx := range indices {
 			out[start+i] = float32(idx)
+		}
+	}
+
+	return newTensor(t.b, t.Shape(), out)
+}
+
+// RoPE applies rotary positional embedding.
+// This implements the fastRoPE interface so nn.RoPE dispatches here.
+func (t *Tensor) RoPE(ctx ml.Context, positions ml.Tensor, ropeDim int, ropeBase, ropeScale float32, options ...func(*rope.Options)) ml.Tensor {
+	// t shape: [dim0, nHeads, seqLen, ...] in GGML col-major convention
+	// For standard RoPE: rotate pairs of elements in the first dimension
+	if len(t.shape) < 3 {
+		return t.Duplicate(ctx)
+	}
+
+	dim0 := t.shape[0]    // head dimension
+	nHeads := t.shape[1]  // number of heads
+	seqLen := t.shape[2]  // sequence length
+
+	if ropeDim <= 0 || ropeDim > dim0 {
+		ropeDim = dim0
+	}
+
+	pos := positions.(*Tensor)
+	out := make([]float32, len(t.data))
+	copy(out, t.data)
+
+	for s := 0; s < seqLen; s++ {
+		position := float64(0)
+		if s < len(pos.data) {
+			position = float64(pos.data[s])
+		}
+
+		for h := 0; h < nHeads; h++ {
+			baseIdx := s*nHeads*dim0 + h*dim0
+			for d := 0; d < ropeDim/2; d++ {
+				freq := position / math.Pow(float64(ropeBase), float64(2*d)/float64(ropeDim))
+				cosVal := float32(math.Cos(freq))
+				sinVal := float32(math.Sin(freq))
+
+				i0 := baseIdx + d
+				i1 := baseIdx + d + ropeDim/2
+
+				if i0 < len(out) && i1 < len(out) {
+					v0 := t.data[i0]
+					v1 := t.data[i1]
+					out[i0] = v0*cosVal - v1*sinVal
+					out[i1] = v0*sinVal + v1*cosVal
+				}
+			}
 		}
 	}
 

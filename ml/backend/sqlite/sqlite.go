@@ -73,13 +73,21 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 		return nil, fmt.Errorf("sqlite schema: %w", err)
 	}
 
-	return &Backend{
+	b := &Backend{
 		db:        db,
 		dbPath:    dbPath,
 		modelPath: modelPath,
 		meta:      meta,
 		tensors:   make(map[string]*Tensor),
-	}, nil
+	}
+
+	// Import and load all tensors eagerly so Get() works immediately
+	if err := b.Load(context.Background(), nil); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("sqlite load: %w", err)
+	}
+
+	return b, nil
 }
 
 func (b *Backend) Close() {
@@ -101,6 +109,8 @@ func (b *Backend) BackendDevices() []ml.DeviceInfo {
 		DeviceID:    ml.DeviceID{ID: "sqlite-cpu-0", Library: "sqlite"},
 		Name:        "sqlite-cpu",
 		Description: "SQLite CPU backend",
+		TotalMemory: 16 * 1024 * 1024 * 1024,
+		FreeMemory:  16 * 1024 * 1024 * 1024,
 	}}
 }
 
