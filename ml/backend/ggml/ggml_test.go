@@ -14,6 +14,8 @@ import (
 func setup(tb testing.TB) ml.Context {
 	tb.Helper()
 
+	tb.Setenv("OLLAMA_BACKEND", "ggml")
+
 	f, err := os.CreateTemp(tb.TempDir(), "*.bin")
 	if err != nil {
 		tb.Fatal(err)
