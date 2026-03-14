@@ -129,6 +129,9 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 		supportedMu := sync.Mutex{}
 		supported := make(map[string]map[string]map[string]int) // [Library][libDir][ID] = pre-deletion devices index
 		for i := range devices {
+			if len(devices[i].LibraryPath) == 0 {
+				continue
+			}
 			libDir := devices[i].LibraryPath[len(devices[i].LibraryPath)-1]
 			if !devices[i].NeedsInitValidation() {
 				// No need to validate, add to the supported map
@@ -245,6 +248,9 @@ func GPUDevices(ctx context.Context, runners []ml.FilteredRunnerDiscovery) []ml.
 		// Reset the libDirs to what we actually wind up using for future refreshes
 		libDirs = make(map[string]struct{})
 		for _, dev := range devices {
+			if len(dev.LibraryPath) == 0 {
+				continue
+			}
 			dir := dev.LibraryPath[len(dev.LibraryPath)-1]
 			if dir != ml.LibOllamaPath {
 				libDirs[dir] = struct{}{}
