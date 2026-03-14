@@ -85,7 +85,7 @@ func RegisterBackend(name string, f func(string, BackendParams) (Backend, error)
 }
 
 func NewBackend(modelPath string, params BackendParams) (Backend, error) {
-	name := "sqlite"
+	name := "duckdb"
 	if env := os.Getenv("OLLAMA_BACKEND"); env != "" {
 		name = env
 	}
