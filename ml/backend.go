@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -84,11 +85,16 @@ func RegisterBackend(name string, f func(string, BackendParams) (Backend, error)
 }
 
 func NewBackend(modelPath string, params BackendParams) (Backend, error) {
-	if backend, ok := backends["ggml"]; ok {
+	name := "sqlite"
+	if env := os.Getenv("OLLAMA_BACKEND"); env != "" {
+		name = env
+	}
+
+	if backend, ok := backends[name]; ok {
 		return backend(modelPath, params)
 	}
 
-	return nil, fmt.Errorf("unsupported backend")
+	return nil, fmt.Errorf("unsupported backend: %s", name)
 }
 
 type Context interface {
