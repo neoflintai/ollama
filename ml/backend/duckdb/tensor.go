@@ -35,8 +35,8 @@ func newTensorFromData(b *Backend, shape []int, data []float32) *Tensor {
 	t := &Tensor{b: b, shape: shape, dtype: ml.DTypeF32, table: nextTable(), data: data}
 	if b != nil && b.db != nil && len(data) > 0 {
 		// Bulk insert via VALUES — build in chunks for large tensors
-		b.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t.table))
-		b.db.Exec(fmt.Sprintf("CREATE TEMPORARY TABLE %s (idx INT, val FLOAT)", t.table))
+		b.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t.ensureTable()))
+		b.db.Exec(fmt.Sprintf("CREATE TEMPORARY TABLE %s (idx INT, val FLOAT)", t.ensureTable()))
 
 		const batch = 10000
 		for start := 0; start < len(data); start += batch {
@@ -77,6 +77,39 @@ func product(shape []int) int {
 	return p
 }
 
+// ensureTable creates a DuckDB temp table for this tensor if it doesn't exist yet.
+// Called lazily before any SQL operation.
+func (t *Tensor) ensureTable() string {
+	if t.table != "" {
+		return t.table
+	}
+	if t.b == nil || t.b.db == nil || len(t.data) == 0 {
+		t.table = nextTable()
+		t.b.db.Exec(fmt.Sprintf("CREATE TEMPORARY TABLE %s (idx INT, val FLOAT)", t.ensureTable()))
+		return t.table
+	}
+	t.table = nextTable()
+	t.b.db.Exec(fmt.Sprintf("CREATE TEMPORARY TABLE %s (idx INT, val FLOAT)", t.ensureTable()))
+
+	// Batch insert using VALUES — faster than row-by-row
+	const batch = 10000
+	for start := 0; start < len(t.data); start += batch {
+		end := start + batch
+		if end > len(t.data) {
+			end = len(t.data)
+		}
+		var vals strings.Builder
+		for i := start; i < end; i++ {
+			if i > start {
+				vals.WriteString(",")
+			}
+			fmt.Fprintf(&vals, "(%d,%e)", i, t.data[i])
+		}
+		t.b.db.Exec(fmt.Sprintf("INSERT INTO %s VALUES %s", t.table, vals.String()))
+	}
+	return t.table
+}
+
 // materialize pulls data from DuckDB into Go slice (lazy, cached)
 func (t *Tensor) materialize() []float32 {
 	if t.data != nil {
@@ -87,7 +120,7 @@ func (t *Tensor) materialize() []float32 {
 	}
 	n := product(t.shape)
 	t.data = make([]float32, n)
-	rows, err := t.b.db.Query(fmt.Sprintf("SELECT idx, val FROM %s ORDER BY idx", t.table))
+	rows, err := t.b.db.Query(fmt.Sprintf("SELECT idx, val FROM %s ORDER BY idx", t.ensureTable()))
 	if err != nil {
 		return t.data
 	}
@@ -165,14 +198,14 @@ func (t *Tensor) FromInts(vals []int32) {
 
 func (t *Tensor) syncToDB() {
 	if t.b != nil && t.b.db != nil && t.table != "" && len(t.data) > 0 {
-		t.b.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t.table))
+		t.b.db.Exec(fmt.Sprintf("DROP TABLE IF EXISTS %s", t.ensureTable()))
 		tmp := newTensorFromData(t.b, t.shape, t.data)
 		t.table = tmp.table
 	}
 }
 
 func (t *Tensor) Cast(ctx ml.Context, dtype ml.DType) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val FROM %s", t.ensureTable()))
 }
 
 // ==================== ARITHMETIC — ALL IN DUCKDB ====================
@@ -199,18 +232,18 @@ func binaryOp(a, b *Tensor, op string) *Tensor {
 		// Same size: direct join on idx
 		query = fmt.Sprintf(
 			"SELECT a.idx, a.val %s b.val AS val FROM %s a JOIN %s b ON a.idx = b.idx",
-			op, a.table, b.table)
+			op, a.ensureTable(), b.ensureTable())
 	} else {
 		// Broadcasting
 		query = fmt.Sprintf(
 			"SELECT a.idx, a.val %s b.val AS val FROM %s a JOIN %s b ON b.idx = a.idx %% %d",
-			op, a.table, b.table, bLen)
+			op, a.ensureTable(), b.ensureTable(), bLen)
 	}
 	return newTensorFromSQL(a.b, a.Shape(), query)
 }
 
 func (t *Tensor) Scale(ctx ml.Context, s float64) ml.Tensor {
-	query := fmt.Sprintf("SELECT idx, val * %g AS val FROM %s", s, t.table)
+	query := fmt.Sprintf("SELECT idx, val * %g AS val FROM %s", s, t.ensureTable())
 	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
@@ -231,7 +264,7 @@ func matmulSQL(a, b *Tensor) *Tensor {
 		// Dot product
 		query := fmt.Sprintf(
 			"SELECT 0 AS idx, SUM(a.val * b.val) AS val FROM %s a JOIN %s b ON a.idx = b.idx",
-			a.table, b.table)
+			a.ensureTable(), b.ensureTable())
 		return newTensorFromSQL(a.b, []int{1}, query)
 	}
 
@@ -249,7 +282,7 @@ func matmulSQL(a, b *Tensor) *Tensor {
 		ON a.a_k = b.b_k
 		GROUP BY a_m, b_n
 		ORDER BY idx
-	`, M, K, K, a.table, K, K, b.table)
+	`, M, K, K, a.ensureTable(), K, K, b.ensureTable())
 
 	return newTensorFromSQL(a.b, []int{M, N}, query)
 }
@@ -268,7 +301,7 @@ func (t *Tensor) Softmax(ctx ml.Context) ml.Tensor {
 		exps AS (SELECT r.idx, r.rid, exp(r.val - mx.m) AS e FROM rows r JOIN mx ON r.rid = mx.rid),
 		sums AS (SELECT rid, sum(e) AS s FROM exps GROUP BY rid)
 		SELECT exps.idx AS idx, exps.e / sums.s AS val FROM exps JOIN sums ON exps.rid = sums.rid
-	`, dim0, dim0, t.table)
+	`, dim0, dim0, t.ensureTable())
 	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
@@ -284,12 +317,12 @@ func (t *Tensor) RMSNorm(ctx ml.Context, weight ml.Tensor, eps float32) ml.Tenso
 		FROM rows
 		JOIN rms ON rows.rid = rms.rid
 		JOIN %s w ON w.idx = rows.cid
-	`, dim0, dim0, t.table, eps, w.table)
+	`, dim0, dim0, t.ensureTable(), eps, w.ensureTable())
 	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
 func (t *Tensor) SILU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	query := fmt.Sprintf("SELECT idx, val / (1.0 + exp(-val)) AS val FROM %s", t.table)
+	query := fmt.Sprintf("SELECT idx, val / (1.0 + exp(-val)) AS val FROM %s", t.ensureTable())
 	out := newTensorFromSQL(t.b, t.Shape(), query)
 	if len(up) > 0 && up[0] != nil {
 		return binaryOp(out, up[0].(*Tensor), "*")
@@ -298,7 +331,7 @@ func (t *Tensor) SILU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
 }
 
 func (t *Tensor) GELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	query := fmt.Sprintf("SELECT idx, 0.5 * val * (1.0 + tanh(val * 0.7978845608 * (1.0 + 0.044715 * val * val))) AS val FROM %s", t.table)
+	query := fmt.Sprintf("SELECT idx, 0.5 * val * (1.0 + tanh(val * 0.7978845608 * (1.0 + 0.044715 * val * val))) AS val FROM %s", t.ensureTable())
 	out := newTensorFromSQL(t.b, t.Shape(), query)
 	if len(up) > 0 && up[0] != nil {
 		return binaryOp(out, up[0].(*Tensor), "*")
@@ -308,12 +341,12 @@ func (t *Tensor) GELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
 
 func (t *Tensor) GELU_ERF(ctx ml.Context) ml.Tensor {
 	// DuckDB doesn't have erf(), use tanh approximation
-	query := fmt.Sprintf("SELECT idx, 0.5 * val * (1.0 + tanh(0.7978845608 * (val + 0.044715 * val * val * val))) AS val FROM %s", t.table)
+	query := fmt.Sprintf("SELECT idx, 0.5 * val * (1.0 + tanh(0.7978845608 * (val + 0.044715 * val * val * val))) AS val FROM %s", t.ensureTable())
 	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
 func (t *Tensor) QuickGELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	query := fmt.Sprintf("SELECT idx, val / (1.0 + exp(-1.702 * val)) AS val FROM %s", t.table)
+	query := fmt.Sprintf("SELECT idx, val / (1.0 + exp(-1.702 * val)) AS val FROM %s", t.ensureTable())
 	out := newTensorFromSQL(t.b, t.Shape(), query)
 	if len(up) > 0 && up[0] != nil {
 		return binaryOp(out, up[0].(*Tensor), "*")
@@ -322,7 +355,7 @@ func (t *Tensor) QuickGELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
 }
 
 func (t *Tensor) RELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
-	query := fmt.Sprintf("SELECT idx, CASE WHEN val > 0 THEN val ELSE 0 END AS val FROM %s", t.table)
+	query := fmt.Sprintf("SELECT idx, CASE WHEN val > 0 THEN val ELSE 0 END AS val FROM %s", t.ensureTable())
 	out := newTensorFromSQL(t.b, t.Shape(), query)
 	if len(up) > 0 && up[0] != nil {
 		return binaryOp(out, up[0].(*Tensor), "*")
@@ -332,7 +365,7 @@ func (t *Tensor) RELU(ctx ml.Context, up ...ml.Tensor) ml.Tensor {
 
 func (t *Tensor) Sigmoid(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, t.Shape(),
-		fmt.Sprintf("SELECT idx, 1.0 / (1.0 + exp(-val)) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT idx, 1.0 / (1.0 + exp(-val)) AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) SigmoidOut(ctx ml.Context) ml.Tensor { return t.Sigmoid(ctx) }
 
@@ -342,19 +375,19 @@ func (t *Tensor) SILUAlphaLimit(ctx ml.Context, up ml.Tensor, alpha, limit float
 			CASE WHEN val < %g THEN %g WHEN val > %g THEN %g ELSE val END
 			/ (1.0 + exp(-%g * CASE WHEN val < %g THEN %g WHEN val > %g THEN %g ELSE val END))
 			AS val FROM %s`,
-		-limit, -limit, limit, limit, alpha, -limit, -limit, limit, limit, t.table)
+		-limit, -limit, limit, limit, alpha, -limit, -limit, limit, limit, t.ensureTable())
 	out := newTensorFromSQL(t.b, t.Shape(), query)
 	return binaryOp(out, up.(*Tensor), "*")
 }
 
 func (t *Tensor) Tanh(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, t.Shape(),
-		fmt.Sprintf("SELECT idx, tanh(val) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT idx, tanh(val) AS val FROM %s", t.ensureTable()))
 }
 
 func (t *Tensor) Softplus(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, t.Shape(),
-		fmt.Sprintf("SELECT idx, ln(1.0 + exp(val)) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT idx, ln(1.0 + exp(val)) AS val FROM %s", t.ensureTable()))
 }
 
 // ==================== NORMALIZATION ====================
@@ -366,7 +399,7 @@ func (t *Tensor) L2Norm(ctx ml.Context, eps float32) ml.Tensor {
 		     norms AS (SELECT rid, sqrt(sum(val*val) + %g) AS n FROM rows GROUP BY rid)
 		SELECT rows.idx AS idx, rows.val / norms.n AS val
 		FROM rows JOIN norms ON rows.rid = norms.rid
-	`, dim0, dim0, t.table, eps)
+	`, dim0, dim0, t.ensureTable(), eps)
 	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
@@ -377,7 +410,7 @@ func (t *Tensor) LayerNorm(ctx ml.Context, weight, bias ml.Tensor, eps float32) 
 	biasExpr := "0"
 	if bias != nil {
 		bt := bias.(*Tensor)
-		biasJoin = fmt.Sprintf("JOIN %s bias ON bias.idx = rows.cid", bt.table)
+		biasJoin = fmt.Sprintf("JOIN %s bias ON bias.idx = rows.cid", bt.ensureTable())
 		biasExpr = "bias.val"
 	}
 	query := fmt.Sprintf(`
@@ -385,7 +418,7 @@ func (t *Tensor) LayerNorm(ctx ml.Context, weight, bias ml.Tensor, eps float32) 
 		     stats AS (SELECT rid, avg(val) AS mu, sqrt(avg(val*val) - avg(val)*avg(val) + %g) AS sigma FROM rows GROUP BY rid)
 		SELECT rows.idx AS idx, ((rows.val - stats.mu) / stats.sigma) * w.val + %s AS val
 		FROM rows JOIN stats ON rows.rid = stats.rid JOIN %s w ON w.idx = rows.cid %s
-	`, dim0, dim0, t.table, eps, biasExpr, w.table, biasJoin)
+	`, dim0, dim0, t.ensureTable(), eps, biasExpr, w.table, biasJoin)
 	return newTensorFromSQL(t.b, t.Shape(), query)
 }
 
@@ -394,7 +427,7 @@ func (t *Tensor) SumRows(ctx ml.Context) ml.Tensor {
 	nrows := product(t.shape) / dim0
 	query := fmt.Sprintf(`
 		SELECT idx // %d AS idx, sum(val) AS val FROM %s GROUP BY idx // %d ORDER BY idx
-	`, dim0, t.table, dim0)
+	`, dim0, t.ensureTable(), dim0)
 	newShape := append([]int{1}, t.shape[1:]...)
 	result := newTensorFromSQL(t.b, newShape, query)
 	_ = nrows
@@ -404,43 +437,43 @@ func (t *Tensor) SumRows(ctx ml.Context) ml.Tensor {
 // ==================== TRIG — IN DUCKDB ====================
 
 func (t *Tensor) Sin(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, sin(val) AS val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, sin(val) AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) Cos(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, cos(val) AS val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, cos(val) AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) Exp(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, exp(val) AS val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, exp(val) AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) Sqrt(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, sqrt(val) AS val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, sqrt(val) AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) Sqr(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val*val AS val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val*val AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) Neg(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, -val AS val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, -val AS val FROM %s", t.ensureTable()))
 }
 func (t *Tensor) Clamp(ctx ml.Context, mn, mx float32) ml.Tensor {
 	return newTensorFromSQL(t.b, t.Shape(),
-		fmt.Sprintf("SELECT idx, GREATEST(%g, LEAST(%g, val)) AS val FROM %s", mn, mx, t.table))
+		fmt.Sprintf("SELECT idx, GREATEST(%g, LEAST(%g, val)) AS val FROM %s", mn, mx, t.ensureTable()))
 }
 
 // ==================== STATS — IN DUCKDB ====================
 
 func (t *Tensor) Mean(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, []int{1},
-		fmt.Sprintf("SELECT 0 AS idx, avg(val) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT 0 AS idx, avg(val) AS val FROM %s", t.ensureTable()))
 }
 
 func (t *Tensor) Variance(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, []int{1},
-		fmt.Sprintf("SELECT 0 AS idx, var_pop(val) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT 0 AS idx, var_pop(val) AS val FROM %s", t.ensureTable()))
 }
 
 func (t *Tensor) Stddev(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, []int{1},
-		fmt.Sprintf("SELECT 0 AS idx, stddev_pop(val) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT 0 AS idx, stddev_pop(val) AS val FROM %s", t.ensureTable()))
 }
 
 func (t *Tensor) TopK(ctx ml.Context, k int) ml.Tensor  { return topK(t, k) }
@@ -450,7 +483,7 @@ func (t *Tensor) Argsort(ctx ml.Context) ml.Tensor       { return argsort(t) }
 
 func (t *Tensor) Reshape(ctx ml.Context, shape ...int) ml.Tensor {
 	// Same data, different shape — just reference same table
-	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, table: t.table}
+	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, table: t.ensureTable()}
 }
 
 func (t *Tensor) View(ctx ml.Context, offset int, shape ...int) ml.Tensor {
@@ -458,7 +491,7 @@ func (t *Tensor) View(ctx ml.Context, offset int, shape ...int) ml.Tensor {
 	elemOffset := offset / 4
 	query := fmt.Sprintf(
 		"SELECT idx - %d AS idx, val FROM %s WHERE idx >= %d AND idx < %d",
-		elemOffset, t.table, elemOffset, elemOffset+total)
+		elemOffset, t.ensureTable(), elemOffset, elemOffset+total)
 	return newTensorFromSQL(t.b, shape, query)
 }
 
@@ -473,7 +506,7 @@ func (t *Tensor) Contiguous(ctx ml.Context, shape ...int) ml.Tensor {
 	if len(shape) == 0 {
 		shape = t.Shape()
 	}
-	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, table: t.table}
+	return &Tensor{b: t.b, shape: shape, dtype: t.dtype, table: t.ensureTable()}
 }
 
 func (t *Tensor) Pad(ctx ml.Context, shape ...int) ml.Tensor {
@@ -483,11 +516,11 @@ func (t *Tensor) Pad(ctx ml.Context, shape ...int) ml.Tensor {
 
 func (t *Tensor) Stack(ctx ml.Context, dim int, s ...ml.Tensor) ml.Tensor {
 	// Union all tables with offset indices
-	parts := []string{fmt.Sprintf("SELECT idx, val FROM %s", t.table)}
+	parts := []string{fmt.Sprintf("SELECT idx, val FROM %s", t.ensureTable())}
 	offset := product(t.shape)
 	for _, st := range s {
 		tt := st.(*Tensor)
-		parts = append(parts, fmt.Sprintf("SELECT idx + %d AS idx, val FROM %s", offset, tt.table))
+		parts = append(parts, fmt.Sprintf("SELECT idx + %d AS idx, val FROM %s", offset, tt.ensureTable()))
 		offset += product(tt.shape)
 	}
 	newShape := t.Shape()
@@ -520,7 +553,7 @@ func (t *Tensor) Repeat4D(ctx ml.Context, d0, d1, d2, d3 int) ml.Tensor {
 func (t *Tensor) Concat(ctx ml.Context, t2 ml.Tensor, dim int) ml.Tensor {
 	b := t2.(*Tensor)
 	offset := product(t.shape)
-	query := fmt.Sprintf("SELECT idx, val FROM %s UNION ALL SELECT idx + %d AS idx, val FROM %s", t.table, offset, b.table)
+	query := fmt.Sprintf("SELECT idx, val FROM %s UNION ALL SELECT idx + %d AS idx, val FROM %s", t.ensureTable(), offset, b.table)
 	newShape := t.Shape()
 	if dim < len(newShape) {
 		newShape[dim] = t.shape[dim] + b.shape[dim]
@@ -540,7 +573,7 @@ func (t *Tensor) Rows(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
 		row := int(idx)
 		parts = append(parts, fmt.Sprintf(
 			"SELECT %d * %d + (idx - %d) AS idx, val FROM %s WHERE idx >= %d AND idx < %d",
-			i, dim0, row*dim0, t.table, row*dim0, (row+1)*dim0))
+			i, dim0, row*dim0, t.ensureTable(), row*dim0, (row+1)*dim0))
 	}
 	if len(parts) == 0 {
 		return newTensorFromData(t.b, []int{0}, nil)
@@ -586,7 +619,7 @@ func (t *Tensor) Copy(ctx ml.Context, t2 ml.Tensor) ml.Tensor {
 }
 
 func (t *Tensor) Duplicate(ctx ml.Context) ml.Tensor {
-	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val FROM %s", t.table))
+	return newTensorFromSQL(t.b, t.Shape(), fmt.Sprintf("SELECT idx, val FROM %s", t.ensureTable()))
 }
 
 func (t *Tensor) Slice(ctx ml.Context, dim, low, high, step int) ml.Tensor {
@@ -608,7 +641,7 @@ func (t *Tensor) ChunkSections(ctx ml.Context, dim int, sections ...int) []ml.Te
 
 func (t *Tensor) CumSum(ctx ml.Context) ml.Tensor {
 	return newTensorFromSQL(t.b, t.Shape(),
-		fmt.Sprintf("SELECT idx, SUM(val) OVER (ORDER BY idx) AS val FROM %s", t.table))
+		fmt.Sprintf("SELECT idx, SUM(val) OVER (ORDER BY idx) AS val FROM %s", t.ensureTable()))
 }
 
 func (t *Tensor) Diag(ctx ml.Context) ml.Tensor {

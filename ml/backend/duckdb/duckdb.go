@@ -73,7 +73,8 @@ func New(modelPath string, params ml.BackendParams) (ml.Backend, error) {
 			shape VARCHAR NOT NULL,
 			rows  INTEGER NOT NULL,
 			cols  INTEGER NOT NULL,
-			data  BLOB    NOT NULL
+			data  BLOB    NOT NULL,
+			fdata FLOAT[] DEFAULT NULL
 		);
 
 		CREATE TABLE IF NOT EXISTS metadata (
@@ -264,6 +265,10 @@ func (b *Backend) importFromGGUF(ctx context.Context, progress func(float32)) er
 }
 
 func (b *Backend) loadAllTensorsFromDB(progress func(float32)) error {
+	// Load tensor metadata + data from persistent table.
+	// Model weights stay as Go slices in memory — DuckDB tables are created
+	// lazily on first computation (the tensor's table field starts empty,
+	// and ops call ensureTable() to push data to DuckDB only when needed).
 	rows, err := b.db.Query("SELECT name, dtype, shape, data FROM tensors")
 	if err != nil {
 		return err
@@ -286,9 +291,15 @@ func (b *Backend) loadAllTensorsFromDB(progress func(float32)) error {
 			return fmt.Errorf("parse shape for %s: %w", name, err)
 		}
 
-		t := newTensorFromData(b, shape, bytesToFloat32(data))
-		t.name = name
-		t.dtype = ml.DType(dtype)
+		// Keep data in Go memory, create DuckDB table lazily on first op
+		t := &Tensor{
+			b:     b,
+			name:  name,
+			shape: shape,
+			dtype: ml.DType(dtype),
+			data:  bytesToFloat32(data),
+			table: "", // empty = not yet in DuckDB, will be created on demand
+		}
 
 		b.mu.Lock()
 		b.tensors[name] = t
@@ -319,10 +330,14 @@ func (b *Backend) loadTensorFromDB(name string) (*Tensor, error) {
 		return nil, err
 	}
 
-	t := newTensorFromData(b, shape, bytesToFloat32(data))
-	t.name = name
-	t.dtype = ml.DType(dtype)
-	return t, nil
+	return &Tensor{
+		b:     b,
+		name:  name,
+		shape: shape,
+		dtype: ml.DType(dtype),
+		data:  bytesToFloat32(data),
+		table: "", // lazy
+	}, nil
 }
 
 func float32ToBytes(f []float32) []byte {
